@@ -1,0 +1,30 @@
+{
+  "name": "pipesam",
+  "version": "1.0.0",
+  "description": "The combined open source version of a pure mesh WebRTC + Mediasoup SFU + Pipecat AI bot capabilities to build next gen voice/video applications.",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Samvyo/pipesam.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Samvyo/pipesam/issues"
+  },
+  "homepage": "https://github.com/Samvyo/pipesam#readme",
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.2.0",
+    "globals": "^17.4.0",
+    "jest": "^30.3.0",
+    "prettier": "^3.8.1"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
