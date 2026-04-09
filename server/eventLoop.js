@@ -1,6 +1,6 @@
 // server/eventLoop.js
 
-const { getEventLoopOrder } = require("./helpers");
+const { getEventgitLoopOrder } = require("./helpers");
 
 function runEventLoopVisualizer() {
   console.log("Start");

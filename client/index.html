@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebSocket Room</title>
+</head>
+<body>
+
+<h2>WebSocket Room</h2>
+
+<div>Status: <span id="status">OFFLINE</span></div>
+
+<input id="username" placeholder="username">
+<input id="roomId" placeholder="room">
+
+<button onclick="app.joinRoom()">Join</button>
+<button onclick="app.sendHello()">Hello</button>
+
+<h3>Active Users</h3>
+<ul id="users"></ul>
+
+<h3>Messages</h3>
+<ul id="messages"></ul>
+
+<script>
+class App {
+  constructor() {
+    this.ws = null;
+    this.peerId = null;
+    this.roomId = null;
+  }
+
+  setStatus(val) {
+    document.getElementById('status').innerText = val ? 'ONLINE' : 'OFFLINE';
+  }
+
+  connectAndJoin() {
+    this.ws = new WebSocket('ws://localhost:3000');
+
+    this.ws.onopen = () => {
+      console.log("Connected → sending join");
+
+      this.setStatus(true);
+
+      this.ws.send(JSON.stringify({
+        type: 'join-room',
+        payload: {
+          roomId: this.roomId,
+          peerId: this.peerId
+        }
+      }));
+    };
+
+    this.ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+
+      if (data.type === 'state-sync') {
+        this.renderUsers(data.payload.peers);
+        this.renderMessages(data.payload.messages);
+      }
+
+      if (data.type === 'peer-joined') {
+        this.addMsg(`${data.payload} joined`);
+        this.renderUsers([...this.getUsers(), data.payload]);
+      }
+
+      if (data.type === 'peer-left') {
+        this.addMsg(`${data.payload} left`);
+        this.renderUsers(this.getUsers().filter(u => u !== data.payload));
+      }
+
+      if (data.type === 'hello') {
+        this.addMsg(`${data.payload} says hello`);
+      }
+    };
+
+    this.ws.onclose = () => {
+      this.setStatus(false);
+    };
+  }
+
+  joinRoom() {
+    const user = document.getElementById('username').value.trim();
+    const room = document.getElementById('roomId').value.trim();
+
+    if (!user || !room) {
+      alert("Enter username and roomId");
+      return;
+    }
+
+    this.peerId = user;
+    this.roomId = room;
+
+    // store in URL for refresh
+    const url = `?user=${user}&room=${room}`;
+    window.history.replaceState({}, '', url);
+
+    // 🔥 IMPORTANT FIX: always create fresh connection
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+
+    this.connectAndJoin();
+  }
+
+  sendHello() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    this.ws.send(JSON.stringify({ type: 'hello' }));
+  }
+
+  renderUsers(users) {
+    const ul = document.getElementById('users');
+    ul.innerHTML = '';
+    users.forEach(u => {
+      const li = document.createElement('li');
+      li.innerText = u;
+      ul.appendChild(li);
+    });
+  }
+
+  getUsers() {
+    return Array.from(document.getElementById('users').children)
+      .map(li => li.innerText);
+  }
+
+  addMsg(msg) {
+    const li = document.createElement('li');
+    li.innerText = msg;
+    document.getElementById('messages').appendChild(li);
+  }
+
+  renderMessages(msgs) {
+    const ul = document.getElementById('messages');
+    ul.innerHTML = '';
+    msgs.forEach(m => {
+      if (m.type === 'hello') {
+        const li = document.createElement('li');
+        li.innerText = `${m.payload} says hello`;
+        ul.appendChild(li);
+      }
+    });
+  }
+}
+
+const app = new App();
+
+window.onload = () => {
+  const params = new URLSearchParams(window.location.search);
+
+  const user = params.get('user');
+  const room = params.get('room');
+
+  if (user && room) {
+    document.getElementById('username').value = user;
+    document.getElementById('roomId').value = room;
+
+    app.peerId = user;
+    app.roomId = room;
+
+    app.connectAndJoin();
+  }
+};
+</script>
+
+</body>
+</html>
