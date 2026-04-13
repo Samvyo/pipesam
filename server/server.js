@@ -122,7 +122,7 @@ wss.on('connection', (ws) => {
         payload: ws.peerId
       }, ws.peerId);
     }
-
+    // signaling messages
     else if (['offer', 'answer','candidate'].includes(data.type)) {
       const room = getRoom(ws.roomId);
       if (!room) return;

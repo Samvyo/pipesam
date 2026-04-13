@@ -1,11 +1,12 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>WebSocket Room</title>
+  <title>WebRTC Room</title>
+  <link rel="icon" href="data:,">
 </head>
 <body>
 
-<h2>WebSocket Room</h2>
+<h2>WebSocket + WebRTC</h2>
 
 <div>Status: <span id="status">OFFLINE</span></div>
 
@@ -15,32 +16,58 @@
 <button onclick="app.joinRoom()">Join</button>
 <button onclick="app.sendHello()">Hello</button>
 
+<!-- hidden until 2 peers in room -->
+<button id="startBtn" onclick="app.startCall()" style="display:none;">Start Call</button>
+
+<!-- hidden until incoming call -->
+<button id="acceptBtn" onclick="app.acceptCall()" style="display:none;">Accept Call</button>
+
 <h3>Active Users</h3>
 <ul id="users"></ul>
 
 <h3>Messages</h3>
 <ul id="messages"></ul>
 
+<h3>Video</h3>
+<video id="localVideo" autoplay muted playsinline width="200"></video>
+<video id="remoteVideo" autoplay playsinline width="200"></video>
+
 <script>
 class App {
   constructor() {
-    this.ws = null;
-    this.peerId = null;
-    this.roomId = null;
+    this.ws           = null;
+    this.peerId       = null;
+    this.roomId       = null;
+    this.pc           = null;
+    this.localStream  = null;
+    this.peers        = [];      // track all peers in room
+    this.pendingOffer = false;
   }
 
+  // STATUS 
   setStatus(val) {
     document.getElementById('status').innerText = val ? 'ONLINE' : 'OFFLINE';
   }
 
+  // SHOW/HIDE Start Call based on peer count 
+  updateCallUI() {
+    const btn = document.getElementById('startBtn');
+    if (this.peers.length >= 2) {
+      btn.style.display = 'inline';
+      console.log("Ready to start call");
+    } else {
+      btn.style.display = 'none';
+      console.log("Waiting for another peer...");
+    }
+  }
+
+  // WEBSOCKET 
   connectAndJoin() {
     this.ws = new WebSocket('ws://localhost:3000');
 
     this.ws.onopen = () => {
       console.log("Connected → sending join");
-
       this.setStatus(true);
-
       this.ws.send(JSON.stringify({
         type: 'join-room',
         payload: {
@@ -50,26 +77,80 @@ class App {
       }));
     };
 
-    this.ws.onmessage = (event) => {
+    this.ws.onmessage = async (event) => {
       const data = JSON.parse(event.data);
 
+      // state-sync: full peer list on join
       if (data.type === 'state-sync') {
-        this.renderUsers(data.payload.peers);
+        this.peers = data.payload.peers;
+        this.renderUsers(this.peers);
         this.renderMessages(data.payload.messages);
+        this.updateCallUI();
+        if (this.peers.length < 2) {
+          this.addMsg("Waiting for another user...");
+        }
       }
 
+      // peer-joined: someone new joined
       if (data.type === 'peer-joined') {
+        this.peers.push(data.payload);
         this.addMsg(`${data.payload} joined`);
-        this.renderUsers([...this.getUsers(), data.payload]);
+        this.renderUsers(this.peers);
+        this.updateCallUI();
       }
 
+      // peer-left: someone disconnected
       if (data.type === 'peer-left') {
+        this.peers = this.peers.filter(p => p !== data.payload);
         this.addMsg(`${data.payload} left`);
-        this.renderUsers(this.getUsers().filter(u => u !== data.payload));
+        this.renderUsers(this.peers);
+        this.updateCallUI();
+
+        // clear remote video
+        document.getElementById('remoteVideo').srcObject = null;
+
+        // close peer connection
+        if (this.pc) {
+          this.pc.close();
+          this.pc = null;
+        }
+
+        // reset buttons
+        document.getElementById('acceptBtn').style.display = 'none';
+        this.pendingOffer = false;
       }
 
       if (data.type === 'hello') {
         this.addMsg(`${data.payload} says hello`);
+      }
+
+      // WebRTC signalling 
+
+      if (data.type === 'offer') {
+        console.log("Received offer");
+        this.createPeerConnection();
+        await this.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+
+        // show Accept button — don't auto-answer
+        this.pendingOffer = true;
+        document.getElementById('acceptBtn').style.display = 'inline';
+        document.getElementById('startBtn').style.display  = 'none';
+        this.addMsg("Incoming call — click Accept Call");
+      }
+
+      if (data.type === 'answer') {
+        console.log("Received answer");
+        await this.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      }
+
+      if (data.type === 'candidate') {
+        if (this.pc) {
+          try {
+            await this.pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+          } catch (e) {
+            console.error("ICE candidate error:", e.message);
+          }
+        }
       }
     };
 
@@ -90,11 +171,8 @@ class App {
     this.peerId = user;
     this.roomId = room;
 
-    // store in URL for refresh
-    const url = `?user=${user}&room=${room}`;
-    window.history.replaceState({}, '', url);
+    window.history.replaceState({}, '', `?user=${user}&room=${room}`);
 
-    // 🔥 IMPORTANT FIX: always create fresh connection
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -105,10 +183,120 @@ class App {
 
   sendHello() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
     this.ws.send(JSON.stringify({ type: 'hello' }));
   }
 
+  //PEER CONNECTION 
+  createPeerConnection() {
+    if (this.pc) {
+      console.log("PC already exists, state:", this.pc.signalingState);
+      return;
+    }
+
+    this.pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
+
+    // create remote stream BEFORE ontrack fires
+    const remoteStream = new MediaStream();
+    const remoteVideo  = document.getElementById('remoteVideo');
+    remoteVideo.srcObject = remoteStream;
+
+    this.pc.ontrack = (event) => {
+      console.log("Track received:", event.track.kind);
+      remoteStream.addTrack(event.track);
+    };
+
+    this.pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        console.log("Sending candidate");
+        this.ws.send(JSON.stringify({
+          type: 'candidate',
+          candidate: event.candidate
+        }));
+      }
+    };
+
+    this.pc.oniceconnectionstatechange = () => {
+      console.log("ICE State:", this.pc.iceConnectionState);
+    };
+
+    this.pc.onconnectionstatechange = () => {
+      console.log("Connection State:", this.pc.connectionState);
+    };
+
+    console.log("RTCPeerConnection created");
+  }
+
+  // MEDIA 
+  async setupMedia() {
+    try {
+      if (!this.localStream) {
+        this.localStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true
+        });
+        console.log("Camera started");
+      }
+
+      document.getElementById('localVideo').srcObject = this.localStream;
+
+      if (this.pc.getSenders().length === 0) {
+        this.localStream.getTracks().forEach(track => {
+          this.pc.addTrack(track, this.localStream);
+        });
+      }
+
+    } catch (err) {
+      console.error("Camera error:", err);
+      alert("Camera access failed: " + err.message);
+    }
+  }
+
+  //CALLER: start call 
+  async startCall() {
+    console.log("Starting call");
+
+    this.createPeerConnection();
+    await this.setupMedia();
+
+    const offer = await this.pc.createOffer({
+      offerToReceiveAudio: true,
+      offerToReceiveVideo: true
+    });
+    await this.pc.setLocalDescription(offer);
+
+    this.ws.send(JSON.stringify({
+      type: 'offer',
+      sdp: offer
+    }));
+
+    // hide Start Call after sending offer
+    document.getElementById('startBtn').style.display = 'none';
+
+    console.log("Offer sent");
+  }
+
+  //CALLEE: accept call 
+  async acceptCall() {
+    if (!this.pendingOffer) return;
+
+    await this.setupMedia();
+
+    const answer = await this.pc.createAnswer();
+    await this.pc.setLocalDescription(answer);
+
+    this.ws.send(JSON.stringify({
+      type: 'answer',
+      sdp: answer
+    }));
+
+    document.getElementById('acceptBtn').style.display = 'none';
+    this.pendingOffer = false;
+    console.log("Answer sent");
+  }
+
+  //UI HELPERS 
   renderUsers(users) {
     const ul = document.getElementById('users');
     ul.innerHTML = '';
@@ -143,21 +331,19 @@ class App {
   }
 }
 
+//  BOOT 
 const app = new App();
 
 window.onload = () => {
   const params = new URLSearchParams(window.location.search);
-
-  const user = params.get('user');
-  const room = params.get('room');
+  const user   = params.get('user');
+  const room   = params.get('room');
 
   if (user && room) {
     document.getElementById('username').value = user;
-    document.getElementById('roomId').value = room;
-
+    document.getElementById('roomId').value   = room;
     app.peerId = user;
     app.roomId = room;
-
     app.connectAndJoin();
   }
 };
