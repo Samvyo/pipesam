@@ -122,7 +122,15 @@ wss.on('connection', (ws) => {
         payload: ws.peerId
       }, ws.peerId);
     }
+
+    else if (['offer', 'answer','candidate'].includes(data.type)) {
+      const room = getRoom(ws.roomId);
+      if (!room) return;
+
+      room.broadcast(data, ws.peerId);
+    }
   });
+
 
   ws.on('close', () => {
     const rId = ws.roomId;
