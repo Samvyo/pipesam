@@ -1,9 +1,30 @@
-const WebSocket = require('ws');
+const express = require('express');
 const pino = require('pino');
-
 const logger = pino({ level: 'info' });
-const wss = new WebSocket.Server({ port: 3000 });
+const http = require('http');
+const WebSocket = require('ws');
+const path = require('path');   
 
+const app = express();          
+
+// Serve client folder (correct path)
+app.use(express.static(path.join(__dirname, '../client')));
+
+// Root route
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, '../client', 'index.html'));
+});
+
+// Create HTTP server
+const server = http.createServer(app);
+
+// Attach WebSocket
+const wss = new WebSocket.Server({ server });
+
+// Listen
+server.listen(3000, '0.0.0.0', () => {
+  console.log("Server running on http://0.0.0.0:3000");
+});
 class Room {
   constructor(roomId) {
     this.roomId = roomId;
@@ -11,6 +32,7 @@ class Room {
     this.sessions = new Map();
     this.messages = [];
     this.recentlyDisconnected = new Map(); // track recent disconnects
+    this.muteStates = new Map(); 
   }
 
   addPeer(peerId, ws) {
@@ -57,6 +79,16 @@ class Room {
       }
     });
   }
+
+  sendTo(targetPeerId, message) {
+    const client = this.peers.get(targetPeerId);
+ 
+    if (client && client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(message));
+    } else {
+      logger.warn({ targetPeerId }, 'sendTo: peer not found or not open');
+    }
+  }
 }
 
 const rooms = new Map();
@@ -72,7 +104,7 @@ wss.on('connection', (ws) => {
   logger.info("New socket connected");
 
   ws.on('message', (raw) => {
-  console.log("Incoming message:", raw.toString()); // ✅ ADD THIS
+  console.log("Incoming message:", raw.toString()); 
 
   let data;
   try {
@@ -98,7 +130,7 @@ wss.on('connection', (ws) => {
         payload: {
           peers: room.listPeers(),
           messages: room.messages,
-          status: isRecovering ? 'recovered' : 'new'
+          muteStates: Object.fromEntries(room.muteStates),
         }
       }));
 
@@ -122,12 +154,39 @@ wss.on('connection', (ws) => {
         payload: ws.peerId
       }, ws.peerId);
     }
-    // signaling messages
-    else if (['offer', 'answer','candidate'].includes(data.type)) {
+
+    else if (data.type === 'mute-status') {
       const room = getRoom(ws.roomId);
       if (!room) return;
 
-      room.broadcast(data, ws.peerId);
+      room.muteStates.set(ws.peerId, data.muted);
+
+      room.broadcast({
+        type: 'mute-status',
+        from: ws.peerId,
+        muted: data.muted
+      }, ws.peerId);
+    }
+    // signaling messages
+    else if (['offer', 'answer', 'candidate'].includes(data.type)) {
+      const room = getRoom(ws.roomId);
+      if (!room) return;
+ 
+      const { to } = data;
+ 
+      if (!to) {
+        logger.warn({ type: data.type }, 'no "to" field on signalling message, broadcasting');
+        room.broadcast(data, ws.peerId);
+        return;
+      }
+ 
+      // forward the message to the specific peer and attach who sent it
+      room.sendTo(to, {
+        ...data,
+        from: ws.peerId   // receiver needs to know who this came from
+      });
+ 
+      logger.info({ event: data.type, from: ws.peerId, to });
     }
   });
 
