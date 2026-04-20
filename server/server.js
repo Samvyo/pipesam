@@ -167,6 +167,34 @@ wss.on('connection', (ws) => {
         muted: data.muted
       }, ws.peerId);
     }
+
+    // 🔥 SCREEN SHARE SIGNALING (ADD THIS)
+    else if (data.type === 'screen-share-start' || data.type === 'screen-share-stop') {
+      const room = getRoom(ws.roomId);
+      if (!room) return;
+
+      console.log("=================================");
+      console.log("[SERVER] Screen event:", data.type);
+      console.log("[SERVER] From:", ws.peerId);
+      console.log("[SERVER] Room:", ws.roomId);
+      console.log("[SERVER] Peers in room:", room.listPeers());
+      console.log("=================================");
+
+      room.peers.forEach((client, peerId) => {
+        console.log("Checking peer:", peerId);
+
+        if (client.readyState === WebSocket.OPEN) {
+          if (client !== ws) {
+            console.log(`[SERVER] → sending ${data.type} to ${peerId}`);
+            client.send(JSON.stringify({
+              type: data.type,
+              from: ws.peerId
+            }));
+          }
+        }
+      });
+    }
+     
     // signaling messages
     else if (['offer', 'answer', 'candidate'].includes(data.type)) {
       const room = getRoom(ws.roomId);
