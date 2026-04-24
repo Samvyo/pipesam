@@ -5,21 +5,42 @@ const http = require('http');
 const WebSocket = require('ws');
 const path = require('path');   
 
-const app = express();          
+const app = express();  
+const cors = require("cors");
+app.use(cors());        
 
+const jwt = require("jsonwebtoken");
+
+
+const JWT_SECRET = "mysecretkey"; // use env later
 // Serve client folder (correct path)
 app.use(express.static(path.join(__dirname, '../client')));
 
 // Root route
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, '../client', 'index.html'));
+app.get("/token", (req, res) => {
+  const { username,roomId } = req.query;
+
+  if (!username || !roomId) {
+    return res.status(400).json({ error: "username and roomIdrequired" });
+  }
+
+  const token = jwt.sign(
+    { 
+      username, 
+      roomId: String(roomId)  
+    },
+    JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+
+  res.json({ token });
 });
 
 // Create HTTP server
 const server = http.createServer(app);
 
 // Attach WebSocket
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ noServer: true });
 
 // Listen
 server.listen(3000, '0.0.0.0', () => {
@@ -33,12 +54,12 @@ class Room {
     this.messages = [];
     this.recentlyDisconnected = new Map(); // track recent disconnects
     this.muteStates = new Map(); 
+    this.screenSharers = {}; 
   }
 
   addPeer(peerId, ws) {
     const sessionId = Date.now() + '-' + Math.random();
     ws.sessionId = sessionId;
-
     let isRecovering = this.peers.has(peerId);
 
     // handle refresh recovery window
@@ -100,8 +121,42 @@ function getRoom(roomId) {
   return rooms.get(roomId);
 }
 
-wss.on('connection', (ws) => {
+server.on('upgrade', (request, socket, head) => {
+  try {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    const token = url.searchParams.get('token');
+
+    console.log("Upgrade request:", request.url);
+    console.log("Token:", token);
+
+    if (!token) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    request.user = decoded;
+
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+
+  } catch (err) {
+    console.log("Upgrade error:", err.message);
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+  }
+});
+
+wss.on('connection', (ws, req) => {
   logger.info("New socket connected");
+
+  ws.user = req.user; // already verified
+
+  console.log("✅ Auth success:", ws.user.username);
+
 
   ws.on('message', (raw) => {
   console.log("Incoming message:", raw.toString()); 
@@ -115,7 +170,13 @@ wss.on('connection', (ws) => {
 
     // join room
     if (data.type === 'join-room') {
-      const { roomId, peerId } = data.payload;
+      if (data.payload?.roomId && data.payload.roomId !== ws.user.roomId) {
+        console.log("❌ Room mismatch attempt");
+        ws.close();
+        return;
+      }
+      const roomId = ws.user.roomId;
+      const peerId = ws.user.username;
       logger.info({ event: 'join-room', peerId, roomId });
       
       const room = getRoom(roomId);
@@ -131,8 +192,36 @@ wss.on('connection', (ws) => {
           peers: room.listPeers(),
           messages: room.messages,
           muteStates: Object.fromEntries(room.muteStates),
+          screenSharers: Object.keys(room.screenSharers || {})
         }
       }));
+      // 🔥 SCREEN SHARE START
+      if (data.type === "screen-share-start") {
+        const room = getRoom(ws.roomId);
+        if (!room) return;
+
+        room.screenSharers = room.screenSharers || {};
+        room.screenSharers[data.from] = true;
+
+        room.broadcast({
+          type: "screen-share-start",
+          from: data.from
+        }, data.from);
+      }
+      // 🔥 SCREEN SHARE STOP
+      if (data.type === "screen-share-stop") {
+        const room = getRoom(ws.roomId);
+        if (!room) return;
+
+        if (room.screenSharers) {
+          delete room.screenSharers[data.from];
+        }
+
+        room.broadcast({
+          type: "screen-share-stop",
+          from: data.from
+        }, data.from);
+      }
 
       if (!isRecovering) {
         room.broadcast(
