@@ -1,3 +1,4 @@
+import { Device } from 'mediasoup-client';
 export default class Room {
   constructor(onStateChange) {
     this._notify = onStateChange; 
@@ -25,6 +26,13 @@ export default class Room {
     this.screenSharers    = {};
     this._connectQueue    = Promise.resolve();
     this.isPolite = {}; 
+    this.device = null;  
+    this.sendTransport = null; 
+    this.recvTransport = null;          
+    this._transportConnectCallback = null; 
+    this._transportConnectErrback = null; 
+    this._produceCallback = null;          
+    this._produceErrback = null;
 
     this.onMessage = null;
     this.onChat = null;
@@ -39,11 +47,16 @@ export default class Room {
 
   setStatus(val) {
     console.log("Status:", val ? "ONLINE" : "OFFLINE");
-
-  // optional: notify React instead
     this.onMessage?.(val ? "Connected" : "Disconnected");
   }
-
+  _send(data) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(data));
+    } else {
+      console.warn("⚠️ WebSocket not ready, skipping:", data.type);
+    }
+  }
+  
   _enqueue(fn) {
     this._connectQueue = this._connectQueue
       .then(() => fn())
@@ -54,18 +67,30 @@ export default class Room {
   connectAndJoin() {
     const token = localStorage.getItem("token");
 
-    this.ws = new WebSocket(
-      `wss://${window.location.hostname}:3000?token=${token}`
-    );
+    // ✅ Step 1: prevent multiple connections
+  if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+    console.warn("⚠️ WebSocket already exists");
+    return;
+  }
 
-    this.ws.onopen = () => {
-      console.log("Connected → sending join");
-      this.setStatus(true);
-      this.ws.send(JSON.stringify({
-        type: 'join-room',
-        payload: { roomId: this.roomId, peerId: this.peerId }
-      }));
-    };
+// ✅ Step 2: use local variable
+  const ws = new WebSocket(
+    `wss://${window.location.hostname}:3000?token=${token}`
+  );
+
+// store reference
+  this.ws = ws;
+
+// ✅ Step 3: use SAME ws inside onopen
+  ws.onopen = () => {
+    console.log("Connected → sending join");
+    this.setStatus(true);
+
+    ws.send(JSON.stringify({
+      type: 'join-room',
+      payload: { roomId: this.roomId, peerId: this.peerId }
+    }));
+  };
 
     this.ws.onerror = (err) => console.error("WebSocket error:", err);
 
@@ -144,6 +169,11 @@ export default class Room {
             this._enqueue(() => this._connectToPeer(peer, this.peerId < peer));
           }
         }
+        // ✅ Request transport after joining
+        setTimeout(() => {
+          console.log("🚀 Initiating transport setup...");
+          this.initTransport();
+        }, 500);
       }
 
       if (data.type === 'peer-joined') {
@@ -181,7 +211,52 @@ export default class Room {
         document.getElementById(`container-${gone}`)?.remove();
       }
 
+      if (data.type === 'produced') {
+        console.log(`✅ Server confirmed producer: ${data.kind} id: ${data.id}`);
+        this._produceCallback?.({ id: data.id });
+      }
+
       if (data.type === 'hello') this.addMsg(`${data.payload} says hello`);
+
+      // ✅ Server created transport — set up client side
+     if (data.type === 'transport-created') {
+      console.log("✅ Transport params received from server");
+      if (!this.device) {
+        await this.loadDevice(data.params.routerRtpCapabilities);
+      } 
+      this.sendTransport = this.device.createSendTransport({
+        id:             data.params.id,
+        iceParameters:  data.params.iceParameters,
+        iceCandidates:  data.params.iceCandidates,
+        dtlsParameters: data.params.dtlsParameters,
+      });
+      console.log("✅ Send transport created on client");
+
+      this.sendTransport.on('connect', ({ dtlsParameters }, callback, errback) => {
+        console.log("🔗 Transport connect event — sending dtlsParameters");
+        this._send({ type: 'connect-transport', dtlsParameters });
+        this._transportConnectCallback = callback;
+        this._transportConnectErrback  = errback;
+      });
+      this.sendTransport.on('produce', (params, callback) => {
+        console.log("⚠️ Dummy produce handler (DTLS trigger only)");
+        callback({ id: 'dummy-id' });
+      });
+
+      console.log("🚀 Triggering DTLS handshake...");
+
+  // 5️⃣ ✅ ADD THIS (DTLS trigger)
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const track = stream.getVideoTracks()[0];
+
+      await this.sendTransport.produce({ track }); 
+}
+
+    // ✅ DTLS handshake complete
+    if (data.type === 'transport-connected') {
+      console.log("✅ DTLS handshake complete! Tunnel ready!");
+      this._transportConnectCallback?.();
+    }
 
       if (data.type === 'offer') {
         const from = data.from;
@@ -211,7 +286,7 @@ export default class Room {
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        this.ws.send(JSON.stringify({ type: 'answer', to: from, from: this.peerId, sdp: answer }));
+        this._send({type: 'answer', to: from, from: this.peerId, sdp: answer });
       }
 
       if (data.type === 'answer') {
@@ -257,12 +332,12 @@ export default class Room {
         if (pc.signalingState !== "stable") return;
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        this.ws.send(JSON.stringify({
+        this._send({
           type: 'offer',
           to: peerId,
           from: this.peerId,
           sdp: pc.localDescription
-      }));
+      });
       console.log(`[${this.peerId}] Sent offer to ${peerId}`);
     }
   } catch (e) {
@@ -372,10 +447,10 @@ export default class Room {
 
         this.onPeerStateChange?.(this.peerId, this.peerStates[this.peerId]);
 
-        this.ws.send(JSON.stringify({ 
+        this._send({ 
           type: "screen-share-start",
           from: this.peerId 
-        }));
+        });
  
         track.onended = () => this.stopScreenShare();
 
@@ -729,9 +804,9 @@ export default class Room {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        this.ws.send(JSON.stringify({
+        this._send({
           type: 'candidate', to: peerId, from: this.peerId, candidate: event.candidate
-        }));
+        });
       }
     };
 
@@ -755,7 +830,7 @@ export default class Room {
           const offer = await pc.createOffer({ iceRestart: true });
           if (pc.signalingState !== "stable") return;
           await pc.setLocalDescription(offer);
-          this.ws.send(JSON.stringify({ type: 'offer', to: peerId, from: this.peerId, sdp: offer }));
+          this._send({type: 'offer', to: peerId, from: this.peerId, sdp: offer });
         } catch (e) {
           console.error("ICE restart failed:", e);
         } finally {
@@ -784,12 +859,12 @@ export default class Room {
         }
         await pc.setLocalDescription(offer);
         if (pc.localDescription?.type === "offer") {
-          this.ws.send(JSON.stringify({
+          this._send({
             type: 'offer',
             to: peerId,
             from: this.peerId,
             sdp: pc.localDescription
-          }));
+          });
         }
 
         } catch (e) {
@@ -871,8 +946,28 @@ export default class Room {
   addChatMsg(msg) {
     this.onChat?.(msg);
   }
+
+  // ✅ MEDIASOUP: Load device with server capabilities
+  async loadDevice(routerRtpCapabilities) {
+    try {
+      this.device = new Device();
+      await this.device.load({ routerRtpCapabilities });
+      console.log("✅ Device loaded");
+      console.log("   Can produce video:", this.device.canProduce('video'));
+      console.log("   Can produce audio:", this.device.canProduce('audio'));
+    } catch (e) {
+      console.error("❌ Device load failed:", e);
+    }
+  }
+
+  // ✅ MEDIASOUP: Ask server to create transport
+  async initTransport() {
+    console.log("🚀 Requesting transport from server...");
+    this._send({ type: 'create-transport' });
+  }
 }
 
+  
 // const app = new App();
 
 // document.addEventListener("DOMContentLoaded", () => {

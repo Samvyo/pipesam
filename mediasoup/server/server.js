@@ -12,6 +12,8 @@ app.use(cors());
 
 const jwt = require("jsonwebtoken");
 
+const mediasoup = require("mediasoup");
+const workers = new Map();
 
 const JWT_SECRET = "mysecretkey"; // use env later
 // Serve client folder (correct path)
@@ -48,9 +50,29 @@ const server = https.createServer(sslOptions, app);
 const wss = new WebSocket.Server({ noServer: true });
 
 // Listen
-server.listen(3000, '0.0.0.0', () => {
-  console.log("Server running on http://0.0.0.0:3000");
-});
+(async () => {
+  await createWorker();
+  server.listen(3000, '0.0.0.0', () => {
+    console.log("Server running on http://0.0.0.0:3000");
+  });
+})();
+
+async function createWorker() {
+  const worker = await mediasoup.createWorker({
+    logLevel: "warn",           // only show warnings, not debug spam
+    rtcMinPort: 40000,          // port range for media traffic
+    rtcMaxPort: 49999,
+  });
+  workers.set("worker-1", worker);
+  console.log("Mediasoup Worker created");
+
+  worker.on("died", () => {
+    console.error("Worker died");
+    process.exit(1);
+  });
+}
+
+
 class Room {
   constructor(roomId) {
     this.roomId = roomId;
@@ -60,6 +82,8 @@ class Room {
     this.recentlyDisconnected = new Map(); // track recent disconnects
     this.muteStates = new Map(); 
     this.screenSharers = {}; 
+    this.router = null;
+    this.transports = new Map();
   }
 
   addPeer(peerId, ws) {
@@ -108,21 +132,49 @@ class Room {
   }
 
   sendTo(targetPeerId, message) {
-    const client = this.peers.get(targetPeerId);
+    const ws = this.peers.get(targetPeerId);
  
-    if (client && client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(message));
+    if (!ws) {
+      logger.warn({ targetPeerId }, 'sendTo: peer not found');
+      return;
+    }
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(message));
     } else {
-      logger.warn({ targetPeerId }, 'sendTo: peer not found or not open');
+      logger.warn({ targetPeerId }, 'sendTo: socket not open');
     }
   }
 }
 
 const rooms = new Map();
 
-function getRoom(roomId) {
+async function getRoom(roomId) {
   if (!rooms.has(roomId)) {
-    rooms.set(roomId, new Room(roomId));
+    const room = new Room(roomId);
+
+    // get the worker we created at startup
+    const worker = workers.get("worker-1");
+
+    // create router for this room
+    // router needs to know which codecs (video/audio formats) it supports
+    room.router = await worker.createRouter({
+      mediaCodecs: [
+        {
+          kind: "audio",
+          mimeType: "audio/opus",  // standard audio codec for WebRTC
+          clockRate: 48000,        // 48kHz sample rate
+          channels: 2              // stereo
+        },
+        {
+          kind: "video",
+          mimeType: "video/VP8",   // standard video codec for WebRTC
+          clockRate: 90000         // standard video clock rate
+        }
+      ]
+    });
+
+    console.log(`✅ Router created for room: ${roomId}`);
+    rooms.set(roomId, room);
   }
   return rooms.get(roomId);
 }
@@ -164,7 +216,7 @@ wss.on('connection', (ws, req) => {
   console.log("✅ Auth success:", ws.user.username);
 
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
   console.log("Incoming message:", raw.toString()); 
 
   let data;
@@ -185,7 +237,7 @@ wss.on('connection', (ws, req) => {
       const peerId = ws.user.username;
       logger.info({ event: 'join-room', peerId, roomId });
       
-      const room = getRoom(roomId);
+      const room = await getRoom(roomId);
 
       ws.roomId = roomId;
       ws.peerId = peerId;
@@ -209,32 +261,32 @@ wss.on('connection', (ws, req) => {
         }
       }));
       // 🔥 SCREEN SHARE START
-      if (data.type === "screen-share-start") {
-        const room = getRoom(ws.roomId);
-        if (!room) return;
+      // if (data.type === "screen-share-start") {
+      //   const room = getRoom(ws.roomId);
+      //   if (!room) return;
 
-        room.screenSharers = room.screenSharers || {};
-        room.screenSharers[data.from] = true;
+      //   room.screenSharers = room.screenSharers || {};
+      //   room.screenSharers[data.from] = true;
 
-        room.broadcast({
-          type: "screen-share-start",
-          from: data.from
-        }, data.from);
-      }
-      // 🔥 SCREEN SHARE STOP
-      if (data.type === "screen-share-stop") {
-        const room = getRoom(ws.roomId);
-        if (!room) return;
+      //   room.broadcast({
+      //     type: "screen-share-start",
+      //     from: data.from
+      //   }, data.from);
+      // }
+      // // 🔥 SCREEN SHARE STOP
+      // if (data.type === "screen-share-stop") {
+      //   const room = getRoom(ws.roomId);
+      //   if (!room) return;
 
-        if (room.screenSharers) {
-          delete room.screenSharers[data.from];
-        }
+      //   if (room.screenSharers) {
+      //     delete room.screenSharers[data.from];
+      //   }
 
-        room.broadcast({
-          type: "screen-share-stop",
-          from: data.from
-        }, data.from);
-      }
+      //   room.broadcast({
+      //     type: "screen-share-stop",
+      //     from: data.from
+      //   }, data.from);
+      // }
 
       if (!isRecovering) {
         room.broadcast(
@@ -245,10 +297,69 @@ wss.on('connection', (ws, req) => {
         logger.info({ peerId, event: 'session-recovered' });
       }
     }
+    
+    else if (data.type === 'create-transport') {
+      const room = await getRoom(ws.roomId);
+      if (!room?.router) {
+        console.error("❌ No router found for room:", ws.roomId);
+        return;
+      }
+
+  // Create a WebRTC transport on the router
+  // This is the tunnel between this peer and the server
+      const transport = await room.router.createWebRtcTransport({
+        listenIps: [{ 
+          ip: "0.0.0.0",
+          announcedIp: "127.0.0.1"  // ← change to your laptop IP for phone testing
+        }],
+        enableUdp: true,   // faster, preferred
+        enableTcp: true,   // fallback if UDP blocked
+        preferUdp: true,
+      });
+
+     // Store transport in room by peerId
+      if (!room.transports) room.transports = new Map();
+      room.transports.set(ws.peerId, transport);
+      console.log(`✅ Transport created for [${ws.peerId}] id: ${transport.id}`);
+
+      // ✅ Send transport details back to browser
+      ws.send(JSON.stringify({
+        type: 'transport-created',
+        params: {
+          id: transport.id,
+          iceParameters: transport.iceParameters,   // ICE credentials
+          iceCandidates: transport.iceCandidates,   // server's IP/port
+          dtlsParameters: transport.dtlsParameters, // encryption params
+          routerRtpCapabilities: room.router.rtpCapabilities // what codecs server supports
+        }
+      }));
+    }
+    // ✅ TRANSPORT CONNECT
+    else if (data.type === 'connect-transport') {
+      const room = await getRoom(ws.roomId);
+      if (!room) return;
+
+      const transport = room.transports?.get(ws.peerId);
+      if (!transport) {
+        console.error("❌ No transport found for peer:", ws.peerId);
+        return;
+      }
+      // ✅ Complete DTLS handshake
+      await transport.connect({
+        dtlsParameters: data.dtlsParameters
+      });
+
+      console.log(`✅ Transport DTLS connected for [${ws.peerId}]`);
+
+      ws.send(JSON.stringify({
+        type: 'transport-connected'
+      }));
+    }
+
 
     // hello message
     else if (data.type === 'hello') {
-      const room = getRoom(ws.roomId);
+      const room = await getRoom(ws.roomId);
       if (!room) return;
 
       room.broadcast({
@@ -258,7 +369,7 @@ wss.on('connection', (ws, req) => {
     }
 
     else if (data.type === 'mute-status') {
-      const room = getRoom(ws.roomId);
+      const room = await getRoom(ws.roomId);
       if (!room) return;
 
       const existing = room.muteStates.get(ws.peerId) || {};
@@ -272,7 +383,7 @@ wss.on('connection', (ws, req) => {
     }
 
     else if (data.type === 'video-status') {
-      const room = getRoom(ws.roomId);
+      const room = await getRoom(ws.roomId);
       if (!room) return;
 
       const existing = room.muteStates.get(ws.peerId) || {};
@@ -287,7 +398,7 @@ wss.on('connection', (ws, req) => {
 
     // 🔥 SCREEN SHARE SIGNALING (ADD THIS)
     else if (data.type === 'screen-share-start' || data.type === 'screen-share-stop') {
-      const room = getRoom(ws.roomId);
+      const room = await getRoom(ws.roomId);
       if (!room) return;
 
       console.log("=================================");
@@ -311,10 +422,10 @@ wss.on('connection', (ws, req) => {
         }
       });
     }
-     
+    
     // signaling messages
     else if (['offer', 'answer', 'candidate'].includes(data.type)) {
-      const room = getRoom(ws.roomId);
+      const room = await getRoom(ws.roomId);
       if (!room) return;
  
       const { to } = data;
