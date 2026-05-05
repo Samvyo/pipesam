@@ -1,17 +1,20 @@
 import { Device } from 'mediasoup-client';
 export default class Room {
   constructor(onStateChange) {
-    this._notify = onStateChange; 
+    // this._notify = onStateChange; 
     this.ws               = null;
+
     this.peerId           = null;
     this.roomId           = null;
-    this.peerConnections  = {};
+
+    // this.peerConnections  = {};
     this.localStream      = null;
+    this.screenTrack      = null;
     this.peers            = new Set();
     this.peerStates       = {};
+    this.screenSharers = {};
     this.statsCache       = {};
-    this.dataChannels     = {};
-    this.screenTrack      = null;
+    // this.dataChannels     = {};
     this.canvas           = null;
     this.ctx              = null;
     this.mixedStream      = null;
@@ -21,18 +24,21 @@ export default class Room {
     this.audioCtx         = null;
     this.audioDest        = null;
     this.peerAudioSources = {};
-    this.pendingCandidates= {};
-    this.isMakingOffer    = {};
-    this.screenSharers    = {};
     this._connectQueue    = Promise.resolve();
-    this.isPolite = {}; 
+
     this.device = null;  
     this.sendTransport = null; 
-    this.recvTransport = null;          
-    this._transportConnectCallback = null; 
-    this._transportConnectErrback = null; 
-    this._produceCallback = null;          
-    this._produceErrback = null;
+    this.recvTransport = null; 
+
+    this._sendConnectCb    = null;
+    this._sendConnectEb    = null;
+    this._recvConnectCb    = null;
+    this._recvConnectEb    = null;
+
+    this._produceCallbacks = new Map(); 
+    this._produced = false;
+    this._producersRequested = false;
+    // this.deviceLoading = null;
 
     this.onMessage = null;
     this.onChat = null;
@@ -42,7 +48,11 @@ export default class Room {
     this.onScreenShare = null;    
     this.onQuality = null;
     this.onLocalScreenStream = null;    
-    this.onAudioTrack = null;    
+    this.onAudioTrack = null; 
+    this._rtpSent = false;   
+
+    this.dataProducer = null;
+    this.dataConsumers = new Map();
   }
 
   setStatus(val) {
@@ -72,10 +82,10 @@ export default class Room {
     console.warn("⚠️ WebSocket already exists");
     return;
   }
-
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
 // ✅ Step 2: use local variable
   const ws = new WebSocket(
-    `wss://${window.location.hostname}:3000?token=${token}`
+    `${protocol}://${window.location.hostname}:3000?token=${token}`
   );
 
 // store reference
@@ -97,6 +107,87 @@ export default class Room {
     this.ws.onmessage = async (event) => {
       const data = JSON.parse(event.data);
       console.log(`[WS @ ${this.peerId}]`, data.type, "from:", data.from || "server");
+      
+      if (data.type === 'transport-connected') {
+
+        if (data.direction === 'send') {
+          console.log("✅ SEND transport connected");
+
+          this._sendConnectCb?.();
+          this._sendConnectCb = null;
+          } 
+
+        if (data.direction === 'recv') {
+          console.log("✅ RECV transport connected");
+
+          this._recvConnectCb?.();
+          this._recvConnectCb = null;
+          
+          }
+        }
+        
+      if (data.type === 'new-consumer') {
+        const { consumerId, producerId, kind, rtpParameters, producerPeerId, appData } = data.params;
+
+        console.log(`📥 new-consumer: kind=${kind} from peer=${producerPeerId}`);
+
+        if (!this.recvTransport) {
+          console.warn("⚠️ recvTransport not ready yet");
+          return;
+        }
+
+        const consumer = await this.recvTransport.consume({
+          id:  consumerId,     // the consumer's own ID
+          producerId,          // which producer this consumes
+          kind,
+          rtpParameters,
+          paused: true
+        });
+        console.log("TRACK STATE:", consumer.track.readyState);
+
+        const stream = new MediaStream([consumer.track]);
+
+        if (kind === 'video' && appData?.type === 'screen') {
+          this.onScreenShare?.(producerPeerId, stream);   // ✅ goes to screen section
+        } else if (kind === 'video') {
+          this.onTrack?.(producerPeerId, stream);
+        } else if (kind === 'audio') {
+          this.onAudioTrack?.(producerPeerId, stream);
+        }
+        this._send({ type: 'resume-consumer', consumerId: consumer.id});
+      }
+
+      
+      if (data.type === 'new-data-producer') {
+        this._pendingDataProducerPeer = this._pendingDataProducerPeer || {};
+        this._pendingDataProducerPeer[data.dataProducerId] = data.producerPeerId;
+  
+        this._send({
+          type: 'consume-data',
+          dataProducerId: data.dataProducerId
+        });
+      }
+
+      if (data.type === 'data-consumer-created') {
+        const { id, dataProducerId, sctpStreamParameters, label } = data.params;
+
+        const dataConsumer = await this.recvTransport.consumeData({
+          id,
+          dataProducerId,
+          sctpStreamParameters,
+          label
+        });
+
+        const senderPeerId = this._pendingDataProducerPeer?.[dataProducerId] || 'peer';
+        delete this._pendingDataProducerPeer?.[dataProducerId];
+
+        dataConsumer.on("message", (msg) => {
+          if (senderPeerId === this.peerId) return;
+          this.addChatMsg(`${senderPeerId}: ${msg}`); 
+        });
+
+        this.dataConsumers.set(id, dataConsumer);
+      } 
 
       if (data.type === "screen-share-start") {
         console.log(`[RECEIVED] ${this.peerId} ← screen share started by ${data.from}`);
@@ -154,26 +245,11 @@ export default class Room {
         if (data.payload.screenSharers) {
           data.payload.screenSharers.forEach(pid => {
             this.screenSharers[pid] = true;
-
-            // const pc = this.createPeerConnection(pid);
-            // pc.addTransceiver("video", { direction: "recvonly" });
-            // this._enqueue(() => this._connectToPeer(pid, false));
-          
             this.peerStates[pid] = { ...(this.peerStates[pid] || {}), isScreenSharing: true };
             this.updatePeerUI(pid);
           });
         }
-
-        for (const peer of this.peers) {
-          if (peer !== this.peerId && !this.peerConnections[peer]) {
-            this._enqueue(() => this._connectToPeer(peer, this.peerId < peer));
-          }
-        }
-        // ✅ Request transport after joining
-        setTimeout(() => {
-          console.log("🚀 Initiating transport setup...");
-          this.initTransport();
-        }, 500);
+        this.initTransport();
       }
 
       if (data.type === 'peer-joined') {
@@ -185,167 +261,172 @@ export default class Room {
         this.updatePeerUI(newPeer);
 
         this.renderUsers();
-        if (newPeer !== this.peerId && !this.peerConnections[newPeer]) {
-          this._enqueue(() => this._connectToPeer(newPeer, this.peerId < newPeer));
-        }
       }
 
       if (data.type === 'peer-left') {
         const gone = data.payload;
+
+        console.log("👋 Peer left:", gone);
+
         this.peers.delete(gone);
-        this.addMsg(`${gone} left`);
-        this.renderUsers();
 
-        const pc = this.peerConnections[gone];
-        if (pc) { pc.close(); delete this.peerConnections[gone]; }
+        // 🔥 remove UI streams
+        this.onTrack?.(gone, null);
+        this.onAudioTrack?.(gone, null);
+        this.onScreenShare?.(gone, null);
 
-        this._removeRecordingPeer(gone);
-
-        delete this.dataChannels[gone];
-        delete this.isMakingOffer[gone];
-        delete this.pendingCandidates[gone];
         delete this.peerStates[gone];
-        delete this.statsCache[gone];
         delete this.screenSharers[gone];
+        delete this.statsCache[gone];
 
-        document.getElementById(`container-${gone}`)?.remove();
+        this.onPeersUpdate?.([...this.peers]);
       }
-
       if (data.type === 'produced') {
-        console.log(`✅ Server confirmed producer: ${data.kind} id: ${data.id}`);
-        this._produceCallback?.({ id: data.id });
+        console.log(`✅ Producer confirmed: kind=${data.kind} id=${data.id}`);
+        // Fix 8: look up by kind — video and audio have separate callbacks
+        const entry = this._produceCallbacks.get(data.kind);
+        if (entry) {
+          entry.callback({ id: data.id });
+          this._produceCallbacks.delete(data.kind); // clean up after resolving
+        }
       }
+
+      if (data.type === 'data-produced') {
+        console.log("✅ DataProducer confirmed:", data.id);
+        if (this._dataProduceCallback) {
+        this._dataProduceCallback({ id: data.id });
+        this._dataProduceCallback = null;
+      }
+    }
 
       if (data.type === 'hello') this.addMsg(`${data.payload} says hello`);
 
       // ✅ Server created transport — set up client side
      if (data.type === 'transport-created') {
-      console.log("✅ Transport params received from server");
       if (!this.device) {
-        await this.loadDevice(data.params.routerRtpCapabilities);
-      } 
-      this.sendTransport = this.device.createSendTransport({
-        id:             data.params.id,
-        iceParameters:  data.params.iceParameters,
-        iceCandidates:  data.params.iceCandidates,
-        dtlsParameters: data.params.dtlsParameters,
-      });
-      console.log("✅ Send transport created on client");
+        this.device = new Device();
+      }
 
-      this.sendTransport.on('connect', ({ dtlsParameters }, callback, errback) => {
-        console.log("🔗 Transport connect event — sending dtlsParameters");
-        this._send({ type: 'connect-transport', dtlsParameters });
-        this._transportConnectCallback = callback;
-        this._transportConnectErrback  = errback;
-      });
-      this.sendTransport.on('produce', (params, callback) => {
-        console.log("⚠️ Dummy produce handler (DTLS trigger only)");
-        callback({ id: 'dummy-id' });
-      });
+      if (!this.device.loaded) {
+        await this.device.load({
+          routerRtpCapabilities: data.params.routerRtpCapabilities
+        });
+       console.log("✅ Device loaded");
+      }
 
-      console.log("🚀 Triggering DTLS handshake...");
+      if (!this._rtpSent && this.device.loaded) {
+        console.log("📡 Sending rtpCapabilities");
 
-  // 5️⃣ ✅ ADD THIS (DTLS trigger)
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      const track = stream.getVideoTracks()[0];
+        this._send({
+          type: 'rtp-capabilities',
+          rtpCapabilities: this.device.rtpCapabilities
+        });
+        this._rtpSent = true;
+      }
+ 
 
-      await this.sendTransport.produce({ track }); 
-}
+      if (data.direction === 'send') {
+        // ── SEND TRANSPORT ────────────────────────────────────────────────────
+        this.sendTransport = this.device.createSendTransport(data.params);
+        console.log("✅ Send transport created:", this.sendTransport.id);
 
-    // ✅ DTLS handshake complete
-    if (data.type === 'transport-connected') {
-      console.log("✅ DTLS handshake complete! Tunnel ready!");
-      this._transportConnectCallback?.();
-    }
+        this.sendTransport.observer.on('close', () => console.log('🔍 sendTransport closed'));
+        this.sendTransport.observer.on('newproducer', producer => {
+          console.log('🔍 new producer:', producer.id, producer.kind);
+          producer.observer.on('close', () => console.log('🔍 producer closed:', producer.id));
+        });
+        this.sendTransport.observer.on('newdataproducer', dp => {
+          console.log('🔍 new dataProducer:', dp.id);
+          dp.observer.on('close', () => console.log('🔍 dataProducer closed:', dp.id));
+        });
 
-      if (data.type === 'offer') {
-        const from = data.from;
-        const pc   = this.createPeerConnection(from);
+        this.sendTransport.on('connect', ({ dtlsParameters }, callback, errback) => {
+          console.log("🔥 SEND connect triggered");
+          this._sendConnectCb = callback;
+          this._sendConnectEb = errback;
+          this._send({
+            type:  'connect-transport',
+            direction: 'send',
+            transportId: this.sendTransport.id, // server finds by id, not peerId
+            dtlsParameters,
+          });
+        });
 
-        if (pc.getSenders().length === 0) {
-          this.isMakingOffer[from] = true;
-          await this.setupMedia(pc, from);
-          this.isMakingOffer[from] = false;
-        }
+        this.sendTransport.on('produce', ({ kind, rtpParameters, appData }, callback, errback) => {
+          console.log("📤 produce event:", kind);
+          this._produceCallbacks.set(kind, { callback, errback });
+          this._send({ type: 'produce', kind, rtpParameters, appData });
+        });
 
-        const isPolite = this.isPolite[from];
-        const offerCollision = this.isMakingOffer[from] || pc.signalingState !== "stable";
-        if (offerCollision) {
-          // const isPolite = this.peerId > from;
-          if (!isPolite) {
-            console.log("❌ Ignoring offer (impolite peer)");
-            return;
+        this.sendTransport.on('producedata', (params, callback, errback) => {
+          console.log("💬 producedata event triggered");
+
+          this._send({
+            type: 'produce-data',
+            sctpStreamParameters: params.sctpStreamParameters,
+            label: params.label
+          });
+
+          this._dataProduceCallback = callback;
+        });
+
+        if (!this._produced) {
+          this._produced = true;
+          const videoTrack = this.localStream?.getVideoTracks()[0];
+          const audioTrack = this.localStream?.getAudioTracks()[0];
+
+          if (videoTrack) {
+            this.sendTransport.produce({ track: videoTrack })
+              .then(() => console.log("🎥 Video producer started"))
+              .catch(e => console.error("❌ Video produce failed:", e));
           }
-
-          console.log("Polite peer rolling back");
-          await pc.setLocalDescription({ type: "rollback" });
+          if (audioTrack) {
+            this.sendTransport.produce({ track: audioTrack })
+              .then(() => console.log("🎤 Audio producer started"))
+              .catch(e => console.error("❌ Audio produce failed:", e));
+            }
+          }
+          if (!this.dataProducer) {
+            this.sendTransport.produceData({ label: 'chat', ordered: true })
+              .then(dp => {
+                this.dataProducer = dp;
+                console.log("💬 DataProducer created");
+              })
+              .catch(e => console.error("❌ DataProducer failed:", e));
+          }
         }
 
-        await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-        await this._flushCandidates(from, pc);
+      if (data.direction === 'recv') {
+        this.recvTransport = this.device.createRecvTransport(data.params);
+        console.log("✅ Recv transport created:", this.recvTransport.id);
 
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        this._send({type: 'answer', to: from, from: this.peerId, sdp: answer });
-      }
+        this.recvTransport.observer.on('close', () => console.log('🔍 recvTransport closed'));
+        this.recvTransport.observer.on('newconsumer', consumer => {
+          console.log('🔍 new consumer:', consumer.id, consumer.kind);
+          consumer.observer.on('close', () => console.log('🔍 consumer closed:', consumer.id));
+        });
+        this.recvTransport.observer.on('newdataconsumer', dc => {
+          console.log('🔍 new dataConsumer:', dc.id);
+          dc.observer.on('close', () => console.log('🔍 dataConsumer closed:', dc.id));
+        });
 
-      if (data.type === 'answer') {
-        const pc = this.peerConnections[data.from];
-        if (pc && pc.signalingState !== "stable") {
-          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-          await this._flushCandidates(data.from, pc);
-        }
-      }
-
-      if (data.type === 'candidate') {
-        const pc = this.peerConnections[data.from];
-        if (!pc) return;
-        const candidate = new RTCIceCandidate(data.candidate);
-        if (!pc.remoteDescription?.type) {
-          if (!this.pendingCandidates[data.from]) this.pendingCandidates[data.from] = [];
-          this.pendingCandidates[data.from].push(candidate);
-          return;
-        }
-        try { await pc.addIceCandidate(candidate); }
-        catch (e) { console.error("ICE candidate error:", e.message); }
-      }
-    };
+        this.recvTransport.on('connect', ({ dtlsParameters }, callback, errback) => {
+          console.log("🔥 RECV connect triggered");
+          this._recvConnectCb = callback;
+          this._recvConnectEb = errback;
+          this._send({
+            type:        'connect-transport',
+            direction: 'recv',
+            transportId: this.recvTransport.id, // different id from send transport
+            dtlsParameters,
+          });
+        });
+    }
+    }
+  }
 
     this.ws.onclose = () => this.setStatus(false);
   }
-
-  async _flushCandidates(peerId, pc) {
-    if (!this.pendingCandidates[peerId]) return;
-    for (const c of this.pendingCandidates[peerId]) {
-      try { await pc.addIceCandidate(c); } catch (e) { console.warn("Queued ICE error:", e); }
-    }
-    delete this.pendingCandidates[peerId];
-  }
-
-  async _connectToPeer(peerId, sendOffer) {
-    this.isPolite[peerId] = this.peerId > peerId;
-    const pc = this.createPeerConnection(peerId);
-    try{
-      this.isMakingOffer[peerId] = true;
-      await this.setupMedia(pc, peerId);
-      if (sendOffer) {
-        if (pc.signalingState !== "stable") return;
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        this._send({
-          type: 'offer',
-          to: peerId,
-          from: this.peerId,
-          sdp: pc.localDescription
-      });
-      console.log(`[${this.peerId}] Sent offer to ${peerId}`);
-    }
-  } catch (e) {
-    console.error(`offer to ${peerId} failed:`, e);
-  } finally {
-    this.isMakingOffer[peerId] = false;
-  } 
-}
 
   async joinRoom(user, roomId) {
     if (!roomId) {
@@ -382,7 +463,7 @@ export default class Room {
       this.onLocalStream?.(this.localStream);
     }
     this.connectAndJoin();
-    this.startStatsMonitoring();
+    // this.startStatsMonitoring();
   }
 
   sendHello() {
@@ -422,38 +503,18 @@ export default class Room {
 
         
         this.screenTrack = track;
-        this.screenTrack = track;
         this.screenSharers[this.peerId] = true;
         this.peerStates[this.peerId] = { ...(this.peerStates[this.peerId] || {}), isScreenSharing: true };
 
-
-        for (const [pid, pc] of Object.entries(this.peerConnections)) {
-        if (pc.screenTransceiver) {
-          // Use pre-created slot from setupMedia
-          await pc.screenTransceiver.sender.replaceTrack(track);
-          pc.screenTransceiver.direction = "sendonly";
-          pc.screenSender = pc.screenTransceiver.sender;
-        } else {
-          // Fallback: create new (should not happen if setupMedia ran)
-          const transceiver = pc.addTransceiver(track, {
-            direction: "sendonly",
-            streams: [screenStream]
-          });
-          pc.screenSender = transceiver.sender;
-          pc.screenTransceiver = transceiver;
-        }
-        console.log("Screen track added to", pid);
-      }
+        this.screenProducer = await this.sendTransport.produce({
+          track,
+          appData: { type: 'screen' }
+        });
 
         this.onPeerStateChange?.(this.peerId, this.peerStates[this.peerId]);
+        this._send({ type: 'screen-share-start', from: this.peerId });
 
-        this._send({ 
-          type: "screen-share-start",
-          from: this.peerId 
-        });
- 
         track.onended = () => this.stopScreenShare();
-
       } else {
         this.stopScreenShare();
       }
@@ -462,36 +523,19 @@ export default class Room {
     }
   }
 
-  async addScreenTransceiver(pc, peerId) {
-    if (pc.screenSender) {
-      await pc.screenSender.replaceTrack(this.screenTrack);
-      return;
-    }
-    const transceiver = pc.addTransceiver(this.screenTrack, {
-      direction: "sendonly",
-      streams: [new MediaStream([this.screenTrack])]
-    });
-    pc.screenSender = transceiver.sender;
-    pc.screenTransceiver = transceiver;
-  }
-
   stopScreenShare() {
   if (!this.screenTrack) return;
   console.log("🛑 Stopping screen share");
+
+   if (this.screenProducer) {
+    try { this.screenProducer.close(); } catch(e) {}
+    this.screenProducer = null;
+  }
 
   this.ws?.send(JSON.stringify({ type: "screen-share-stop", from: this.peerId }));
 
   delete this.screenSharers[this.peerId];
   this.peerStates[this.peerId] = { ...(this.peerStates[this.peerId] || {}), isScreenSharing: false };
-
-  Object.values(this.peerConnections).forEach(pc => {
-    if (pc.screenSender) {
-      const transceiver = pc.getTransceivers().find(t => t.sender === pc.screenSender);
-      pc.screenSender.replaceTrack(null);
-      if (transceiver) transceiver.direction = "inactive"; // ✅ keeps slot, just deactivates
-      pc.screenSender = null;
-    }
-  });
 
   this.screenTrack.stop();
   this.screenTrack = null;
@@ -524,11 +568,6 @@ export default class Room {
     this.localStream.getAudioTracks().forEach(track =>
       this.audioCtx.createMediaStreamSource(new MediaStream([track])).connect(this.audioDest)
     );
-
-  // All currently connected remote peers audio
-    for (const pid of Object.keys(this.peerConnections)) {
-      this._addPeerAudioToRecording(pid);
-    }
 
   // ✅ Combined stream: canvas video + mixed audio
     this.mixedStream = this.canvas.captureStream(30);
@@ -643,28 +682,6 @@ export default class Room {
   // audioCtx closed in recorder.onstop
   }
 
-  _addPeerAudioToRecording(peerId) {
-    if (!this.audioCtx || !this.audioDest || this.peerAudioSources[peerId]) return;
-
-  // ✅ No DOM audio elements in React — pull directly from RTCRtpReceiver
-    const pc = this.peerConnections[peerId];
-    if (!pc) return;
-
-    const audioReceiver = pc.getReceivers().find(r => r.track?.kind === "audio");
-    if (!audioReceiver?.track) return;
-
-    try {
-      const src = this.audioCtx.createMediaStreamSource(
-        new MediaStream([audioReceiver.track])
-      );
-      src.connect(this.audioDest);
-      this.peerAudioSources[peerId] = src;
-      console.log("🎙 Added audio from", peerId, "to recording mix");
-    } catch (e) {
-      console.warn("Peer audio mix error:", e);
-    }
-  }
-
   _removeRecordingPeer(peerId) {
     const src = this.peerAudioSources[peerId];
     if (src) { try { src.disconnect(); } catch (_) {} delete this.peerAudioSources[peerId]; }
@@ -675,239 +692,12 @@ export default class Room {
     this.onPeerStateChange?.(peerId, state);
   }
 
-  startStatsMonitoring() {
-    setInterval(async () => {
-      for (const peerId in this.peerConnections) {
-        const pc = this.peerConnections[peerId];
-        if (!pc) continue;
-        this.parseStats(await pc.getStats(), peerId);
-      }
-    }, 2000);
-  }
-
-  parseStats(stats, peerId) {
-    let rtt = null, jitter = null, packetsLost = null, bitrate = null;
-    const pc = this.peerConnections[peerId];
-    if (!pc) return;
-
-    stats.forEach(report => {
-      if (report.type === "candidate-pair" && report.state === "succeeded")
-        rtt = report.currentRoundTripTime;
-
-      if (report.type === "inbound-rtp" && (report.kind === "video" || report.mediaType === "video")) {
-        jitter      = report.jitter;
-        packetsLost = report.packetsLost;
-      }
-
-      if (report.type === "outbound-rtp" && (report.kind === "video" || report.mediaType === "video")) {
-        const prev = this.statsCache[peerId];
-        if (prev) {
-          const timeDiff = report.timestamp - prev.timestamp;
-          const byteDiff = report.bytesSent  - prev.bytesSent;
-          bitrate = timeDiff > 0 ? (8 * byteDiff) / timeDiff : 0;
-        }
-        this.statsCache[peerId] = { timestamp: report.timestamp, bytesSent: report.bytesSent };
-      }
-    });
-
-    console.log(`[${peerId}] RTT:${rtt?.toFixed(3)} Jitter:${jitter?.toFixed(3)} Loss:${packetsLost ?? 0} Bitrate:${bitrate?.toFixed(2) ?? 0}kbps`);
-
-    const quality = this.getConnectionQuality(rtt, packetsLost, jitter);
-    this.updateQualityBadge(peerId, quality, rtt);
-  
-    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-    if (!sender) return;
-    const params = sender.getParameters();
-    if (!params.encodings) params.encodings = [{}];
-
-    if (['failed', 'disconnected'].includes(pc.iceConnectionState) || !bitrate || bitrate < 50) {
-      params.encodings[0].maxBitrate = 200_000;
-    } else if (rtt > 0.3 || jitter > 0.05) {
-      params.encodings[0].maxBitrate = 300_000;
-    } else {
-      params.encodings[0].maxBitrate = 1_500_000;
-    }
-    sender.setParameters(params);
-  }
-
-  getConnectionQuality(rtt, loss, jitter) {
-    if (!rtt) return "unknown";
-    const rttMs = rtt * 1000;
-
-    if (rttMs < 150 && loss < 2 && jitter < 0.03) return "good";
-    if (rttMs < 300 && loss < 5) return "fair";
-    return "poor";
-  }
   
   updateQualityBadge(peerId, quality, rtt) {
-  const ms = rtt ? (rtt * 1000).toFixed(0) : "?";
-  this.onQuality?.(peerId, { quality, ms });
-
-  // let icon = "⚪";
-  // let text = "Unknown";
-
-  // if (quality === "good") {
-  //   icon = "🟢";
-  //   text = "Good";
-  // } else if (quality === "fair") {
-  //   icon = "🟡"; 
-  //   text = "Fair";
-  // } else if (quality === "poor") {
-  //   icon = "🔴";
-  //   text = "Poor";
-  // }
-
-}
-
-  createPeerConnection(peerId) {
-    if (this.peerConnections[peerId]) return this.peerConnections[peerId];
-
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "turn:localhost:3478", username: "test", credential: "test" }
-      ]
-    });
-
-    if (this.peerId < peerId) {
-      const ch = pc.createDataChannel("chat", { ordered: true });
-      this.setupDataChannel(ch, peerId);
-    }
-    pc.ondatachannel = (event) => this.setupDataChannel(event.channel, peerId);
-
-  
-    pc.ontrack = (event) => {
-      if (event.track.kind === "video") {
-        const videoTxcvrs = pc.getTransceivers()
-          .filter(t => t.receiver.track?.kind === "video");
-
-        const isScreen = videoTxcvrs.length > 1 &&
-          event.transceiver === videoTxcvrs[videoTxcvrs.length - 1];
-
-        const stream = event.streams[0] || new MediaStream([event.track]);
-
-        if (isScreen) {
-          console.log("📺 Screen track from", peerId);
-          this.onScreenShare?.(peerId, stream);
-        } else {
-          console.log("📷 Camera track from", peerId);
-          this.onTrack?.(peerId, stream);
-        }
-      }
-
-      if (event.track.kind === "audio") {
-        const stream = new MediaStream([event.track]);
-        this.onAudioTrack?.(peerId, stream);
-        if (this.recorder) this._addPeerAudioToRecording(peerId);
-      }
-    };
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        this._send({
-          type: 'candidate', to: peerId, from: this.peerId, candidate: event.candidate
-        });
-      }
-    };
-
-    pc.oniceconnectionstatechange = async () => {
-      console.log("ICE State:", pc.iceConnectionState);
-      if (pc.iceConnectionState === "failed") {
-        if (pc.signalingState !== "stable") {
-          await new Promise(resolve => {
-            const check = () => {
-              if (pc.signalingState === "stable") {
-                pc.removeEventListener("signalingstatechange", check);
-                resolve();
-              }
-            };
-            pc.addEventListener("signalingstatechange", check);
-          });
-        }
-        if (this.isMakingOffer[peerId]) return;
-        try {
-          this.isMakingOffer[peerId] = true;
-          const offer = await pc.createOffer({ iceRestart: true });
-          if (pc.signalingState !== "stable") return;
-          await pc.setLocalDescription(offer);
-          this._send({type: 'offer', to: peerId, from: this.peerId, sdp: offer });
-        } catch (e) {
-          console.error("ICE restart failed:", e);
-        } finally {
-          this.isMakingOffer[peerId] = false;
-        }
-      }
-    };
-
-    pc.onconnectionstatechange = () => console.log("Connection State:", pc.connectionState);
-
-    pc.onnegotiationneeded = async () => {
-      if (this.isMakingOffer[peerId]) return;
-      if (pc.signalingState !== "stable") {
-        console.log(`[${peerId}] Skip negotiation — state: ${pc.signalingState}`);
-        return;
-      }
-      try {
-        this.isMakingOffer[peerId] = true;
-        console.log(`[${this.peerId}] 🔄 Renegotiating with ${peerId}`);
-
-        const offer = await pc.createOffer();
-        // Double-check state hasn't changed while awaiting createOffer
-        if (pc.signalingState !== "stable") {
-          console.log("⚠️ Abort setLocalDescription — state changed:", pc.signalingState);
-          return;
-        }
-        await pc.setLocalDescription(offer);
-        if (pc.localDescription?.type === "offer") {
-          this._send({
-            type: 'offer',
-            to: peerId,
-            from: this.peerId,
-            sdp: pc.localDescription
-          });
-        }
-
-        } catch (e) {
-          console.warn("⚠️ negotiation error:", e.message);
-        } finally {
-          this.isMakingOffer[peerId] = false;
-        }
-      }
-    
-
-    this.peerConnections[peerId] = pc;
-    setTimeout(() => this.updatePeerUI(peerId), 0);
-    return pc;
+    const ms = rtt ? (rtt * 1000).toFixed(0) : "?";
+    this.onQuality?.(peerId, { quality, ms });
   }
 
-  async setupMedia(pc, peerId) {
-    if (!this.localStream) {
-      this.localStream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-      });
-    }
-    // document.getElementById('localVideo').srcObject = this.localStream;
-
-    this.localStream.getTracks().forEach(track => {
-      const alreadyAdded = pc.getSenders().some(s => s.track === track);
-      if (!alreadyAdded) pc.addTrack(track, this.localStream);
-    });
-
-  // ✅ Always pre-create a dedicated screen transceiver (sendonly placeholder)
-  // so it's always the SECOND video transceiver, predictably
-    if (!pc.screenTransceiver) {
-      pc.screenTransceiver = pc.addTransceiver("video", {
-        direction: "inactive"  // inactive until screen share starts
-      });
-    }
-    if (this.screenTrack && pc.screenTransceiver) {
-      await pc.screenTransceiver.sender.replaceTrack(this.screenTrack);
-      pc.screenTransceiver.direction = "sendonly";
-      pc.screenSender = pc.screenTransceiver.sender;
-    }
-  }
-  
   renderUsers() {
     this.onPeersUpdate?.([...this.peers]);
   }
@@ -924,29 +714,66 @@ export default class Room {
     });
   }
 
-  setupDataChannel(channel, peerId) {
-    const existing = this.dataChannels[peerId];
-    if (existing && existing.readyState === "open") return;
-    this.dataChannels[peerId] = channel;
-    channel.onopen    = () => console.log("Chat connected with", peerId);
-    channel.onmessage = (e) => this.addChatMsg(`${peerId}: ${e.data}`);
-    channel.onclose   = () => { if (this.dataChannels[peerId] === channel) delete this.dataChannels[peerId]; };
-    channel.onerror   = (err) => console.error("Data channel error:", err);
-  }
 
   sendChat(msg) {
     if (!msg) return;
+
     this.addChatMsg(`You: ${msg}`);
 
-    Object.values(this.dataChannels).forEach(ch => {
-      if (ch.readyState === "open") ch.send(msg);
-    });
+    if (this.dataProducer) {
+      this.dataProducer.send(msg);
+    } else {
+      console.warn("⚠️ DataProducer not ready");
+    }
   }
 
   addChatMsg(msg) {
     this.onChat?.(msg);
   }
+  
+  leave() {
+    console.log("🚪 Leaving room...");
 
+    if (this.dataProducer) {
+      try { this.dataProducer.close(); } catch(e) {}
+      this.dataProducer = null;
+    }
+
+    for (const [id, dc] of this.dataConsumers) {
+      try { dc.close(); } catch(e) {}
+    }
+    this.dataConsumers.clear();
+
+    if (this.sendTransport) {
+      try { this.sendTransport.close(); } catch(e) {}
+      this.sendTransport = null;
+    }
+    if (this.recvTransport) {
+      try { this.recvTransport.close(); } catch(e) {}
+      this.recvTransport = null;
+    }
+    
+    this.localStream = null;
+
+    if (this.screenProducer) {
+      try { this.screenProducer.close(); } catch(e) {}
+      this.screenProducer = null;
+    }
+
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+
+    this._produced = false;
+    this._producersRequested = false;
+    this._rtpSent = false;
+    this.device = null;
+    this.peers = new Set();
+    this.peerStates = {};
+    this.screenSharers = {};
+    this.dataConsumers = new Map();
+  }
   // ✅ MEDIASOUP: Load device with server capabilities
   async loadDevice(routerRtpCapabilities) {
     try {
@@ -962,41 +789,19 @@ export default class Room {
 
   // ✅ MEDIASOUP: Ask server to create transport
   async initTransport() {
-    console.log("🚀 Requesting transport from server...");
-    this._send({ type: 'create-transport' });
+    console.log("🚀 Requesting BOTH transports from server...");
+
+    // 1️⃣ SEND transport
+    this._send({
+      type: 'create-transport',
+      direction: 'send'
+    });
+
+    // 2️⃣ RECV transport
+    this._send({
+      type: 'create-transport',
+      direction: 'recv'
+    });
   }
 }
 
-  
-// const app = new App();
-
-// document.addEventListener("DOMContentLoaded", () => {
-//   document.getElementById("chatInput").addEventListener("keypress", (e) => {
-//     if (e.key === "Enter") app.sendChat();
-//   });
-// });
-
-// window.onload = async () => {
-//   if (!app.localStream) {
-//     try {
-//       app.localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-//       document.getElementById('localVideo').srcObject = app.localStream;
-//     } catch (e) { console.warn("Camera pre-warm failed:", e.message); }
-//   }
-//   console.log("Preview started");
-
-//   const params = new URLSearchParams(window.location.search);
-//   const user   = params.get('user');
-//   const room   = params.get('room');
-
-//   if (user && room) {
-//     document.getElementById('username').value = user;
-//     document.getElementById('roomId').value   = room;
-//     app.peerId = user;
-//     app.roomId = room;
-//     // const localLabel = document.getElementById('localLabel');
-//     // if (localLabel) localLabel.innerText = `You (${user}) 🔊`;
-//     app.connectAndJoin();
-//     app.startStatsMonitoring();
-//   }
-// }

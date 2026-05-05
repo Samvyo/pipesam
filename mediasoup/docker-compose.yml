@@ -11,10 +11,14 @@ services:
 
   signaling:
     build: ./server
-    ports:
-      - "3000:3000"
+    network_mode: "host" 
+    # ports:
+    #   - "3000:3000"
+    #   - "40000-49999:40000-49999/udp" 
     volumes:
       - ./certs:/certs
+    environment:
+      - ANNOUNCED_IP=192.168.29.230
 
   coturn:
     image: coturn/coturn
