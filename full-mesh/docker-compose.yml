@@ -1,0 +1,33 @@
+services:
+
+  client:
+    build: ./client
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./client/certs:/certs
+    depends_on:
+      - signaling
+
+  signaling:
+    build: ./server
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./client/certs:/certs
+
+  coturn:
+    image: coturn/coturn
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+    command: >
+      -n
+      --log-file=stdout
+      --min-port=49152
+      --max-port=49200
+      --realm=webrtc.local
+      --user=test:test
+      --no-cli
+      --no-multicast-peers
+      --fingerprint
