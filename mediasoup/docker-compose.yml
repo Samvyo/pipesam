@@ -12,13 +12,11 @@ services:
   signaling:
     build: ./server
     network_mode: "host" 
-    # ports:
-    #   - "3000:3000"
-    #   - "40000-49999:40000-49999/udp" 
     volumes:
       - ./certs:/certs
+      - ./recordings:/app/recordings 
     environment:
-      - ANNOUNCED_IP=192.168.29.230
+      - ANNOUNCED_IP=192.168.29.231
 
   coturn:
     image: coturn/coturn

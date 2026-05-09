@@ -15,15 +15,15 @@ export default class Room {
     this.screenSharers = {};
     this.statsCache       = {};
     // this.dataChannels     = {};
-    this.canvas           = null;
-    this.ctx              = null;
-    this.mixedStream      = null;
-    this.recorder         = null;
-    this.recordedChunks   = [];
-    this.recordingRAF     = null;
-    this.audioCtx         = null;
-    this.audioDest        = null;
-    this.peerAudioSources = {};
+    // this.canvas           = null;
+    // this.ctx              = null;
+    // this.mixedStream      = null;
+    // this.recorder         = null;
+    // this.recordedChunks   = [];
+    // this.recordingRAF     = null;
+    // this.audioCtx         = null;
+    // this.audioDest        = null;
+    // this.peerAudioSources = {};
     this._connectQueue    = Promise.resolve();
 
     this.device = null;  
@@ -50,6 +50,8 @@ export default class Room {
     this.onLocalScreenStream = null;    
     this.onAudioTrack = null; 
     this._rtpSent = false;   
+    this.onRecordingChange = null;  // fires when recording starts/stops
+    this.onRecordingError  = null;  // fires when server rejects the request
 
     this.dataProducer = null;
     this.dataConsumers = new Map();
@@ -299,6 +301,31 @@ export default class Room {
       }
     }
 
+    if (data.type === 'video-paused') {
+        console.warn(`📵 Video paused (low bandwidth) for consumer ${data.consumerId}`);
+        this.onMessage?.(`⚠️ Poor connection — switching to audio only`);
+    }
+
+    if (data.type === 'video-resumed') {
+        console.log(`✅ Video resumed for consumer ${data.consumerId}`);
+        this.onMessage?.(`✅ Connection improved — video restored`);
+    }
+
+    if (data.type === 'recording-started') {
+      console.log(`⏺ Recording started by ${data.startedBy}`);
+      this.onRecordingChange?.(true, data.startedBy);
+    }
+
+    if (data.type === 'recording-stopped') {
+      console.log('⏹ Recording stopped');
+      this.onRecordingChange?.(false, null);
+    } 
+
+    if (data.type === 'recording-error') {
+      console.warn('Recording error:', data.message);
+      this.onRecordingError?.(data.message);
+    }
+
       if (data.type === 'hello') this.addMsg(`${data.payload} says hello`);
 
       // ✅ Server created transport — set up client side
@@ -375,11 +402,26 @@ export default class Room {
           const videoTrack = this.localStream?.getVideoTracks()[0];
           const audioTrack = this.localStream?.getAudioTracks()[0];
 
+          // REPLACE WITH THIS
           if (videoTrack) {
-            this.sendTransport.produce({ track: videoTrack })
-              .then(() => console.log("🎥 Video producer started"))
+            this.sendTransport.produce({
+              track: videoTrack,
+              encodings: [
+                { rid: 'low',  maxBitrate:  150_000, scaleResolutionDownBy: 4 },
+                { rid: 'mid',  maxBitrate:  500_000, scaleResolutionDownBy: 2 },
+                { rid: 'high', maxBitrate: 1_200_000, scaleResolutionDownBy: 1 },
+              ],
+              codecOptions: {
+                videoGoogleStartBitrate: 1000
+              }
+            }) 
+              .then(producer => {
+                this.videoProducer = producer;
+                console.log("🎥 Video producer started with simulcast (low/mid/high)");
+              })
               .catch(e => console.error("❌ Video produce failed:", e));
           }
+
           if (audioTrack) {
             this.sendTransport.produce({ track: audioTrack })
               .then(() => console.log("🎤 Audio producer started"))
@@ -456,7 +498,11 @@ export default class Room {
   // ✅ Ensure media BEFORE connection
     if (!this.localStream) {
       this.localStream = await navigator.mediaDevices.getUserMedia({
-        video: true,
+        video: {
+          width:  { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 }
+      },
         audio: true
       });
 
@@ -543,149 +589,14 @@ export default class Room {
 
   this.onPeerStateChange?.(this.peerId, this.peerStates[this.peerId]);
 }
-
-  // 
-  
-  async startRecording() {
-    if (this.recorder) { console.warn("Already recording"); return; }
-    if (!this.localStream) return;
-    console.log("⏺ Recording started");
-
-  // ✅ Canvas setup — same dimensions as index.html
-    this.canvas = document.createElement("canvas");
-    this.canvas.width  = 1280;
-    this.canvas.height = 720;
-    this.ctx = this.canvas.getContext("2d");
-
-  // ✅ Audio: Web Audio mixer — local mic + all current remote peers
-    this.audioCtx  = new AudioContext();
-    if (this.audioCtx.state === "suspended") {
-    await this.audioCtx.resume();
-    }
-    this.audioDest = this.audioCtx.createMediaStreamDestination();
-
-  // Local mic
-    this.localStream.getAudioTracks().forEach(track =>
-      this.audioCtx.createMediaStreamSource(new MediaStream([track])).connect(this.audioDest)
-    );
-
-  // ✅ Combined stream: canvas video + mixed audio
-    this.mixedStream = this.canvas.captureStream(30);
-    if (this.mixedStream.getVideoTracks().length === 0) {
-      console.error("❌ No video track in canvas stream");
-      return;
-    }
-
-    console.log("🎥 Mixed stream tracks:", this.mixedStream.getTracks());
-    console.log("🎥 Video tracks:", this.mixedStream.getVideoTracks().length);
-    this.audioDest.stream.getAudioTracks().forEach(t => this.mixedStream.addTrack(t));
-
-    const options = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
-      ? { mimeType: "video/webm;codecs=vp9,opus" }
-      : { mimeType: "video/webm" };
-
-    this.recorder = new MediaRecorder(this.mixedStream, options);
-    this.recordedChunks = [];
-
-    this.recorder.ondataavailable = (e) => {
-      console.log("chunk size:", e.data.size); // 🔥 debug
-      if (e.data.size > 0) {
-        this.recordedChunks.push(e.data);
-      }
-    };
-
-    this.recorder.onstop = () => {
-      const blob = new Blob(this.recordedChunks, { type: "video/webm" });
-      console.log("Final blob size:", blob.size);
-
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = "meeting-recording.webm";
-      a.click();
-      if (this.audioCtx) { this.audioCtx.close(); this.audioCtx = null; }
-    };
-
-    // 🔥 wait until at least one video is ready
-      const waitForVideo = () => new Promise(resolve => {
-        const interval = setInterval(() => {
-          const videos = document.querySelectorAll("video");
-          const ready = Array.from(videos).some(v => v.readyState >= 2);
-
-          if (ready) {
-            clearInterval(interval);
-            resolve();
-          }
-        }, 200);
-      });
-
-      await waitForVideo();
-
-      const drawFrame = () => {
-        this._drawCompositeFrame();
-        this.recordingRAF = requestAnimationFrame(drawFrame);
-      };
-      drawFrame();
-
-      this.recorder.start(1000); // chunk every 1s same as index.html
-    }
-
-// ✅ Canvas compositor — same logic as index.html _drawCompositeFrame
-// but uses data-type attributes instead of DOM IDs (React has no video-${peerId})
-  _drawCompositeFrame() {
-    const W = 1280, H = 720;
-    this.ctx.fillStyle = "#000";
-    this.ctx.fillRect(0, 0, W, H);
-
-  // Check if anyone is screen sharing
-    const sharerPid = Object.keys(this.screenSharers)[0];
-    let camY = 0;
-    let camH = H;
-
-    if (sharerPid) {
-    // ✅ React: find screen video by data-type="screen" attribute
-      const screenEl = document.querySelector('video[data-type="screen"]');
-      if (screenEl && screenEl.srcObject && screenEl.readyState >= 2) {
-        const sh = Math.round(H * 0.78); // top 78% = screen
-        this.ctx.drawImage(screenEl, 0, 0, W, sh);
-        camY = sh;
-        camH = H - sh; // bottom 22% = cameras
-      }
-    }
-
-  // ✅ React: find all camera videos by data-type="camera" attribute
-    const camEls = Array.from(document.querySelectorAll('video[data-type="camera"]'))
-      .filter(el => el.readyState >= 2 && el.videoWidth > 0);
-
-    if (camEls.length > 0) {
-      const cellW = Math.floor(W / camEls.length);
-      camEls.forEach((el, i) => {
-        this.ctx.drawImage(el, i * cellW, camY, cellW, camH);
-      });
-    }
+  startRecording() {
+    this._send({ type: 'start-recording' });
   }
 
-// ✅ Fix stopRecording — cancel RAF and close audioCtx
   stopRecording() {
-    if (!this.recorder) return;
-    console.log("⏹ Recording stopped");
-    this.recorder.requestData();
-    this.recorder.stop();
-    cancelAnimationFrame(this.recordingRAF);
-    this.recordingRAF = null;
-    this.mixedStream?.getTracks().forEach(t => t.stop());
-    this.mixedStream = null;
-
-    this.canvas = null;
-    this.ctx = null;
-    this.recorder = null;
-    this.peerAudioSources = {};
-  // audioCtx closed in recorder.onstop
+    this._send({ type: 'stop-recording' });
   }
 
-  _removeRecordingPeer(peerId) {
-    const src = this.peerAudioSources[peerId];
-    if (src) { try { src.disconnect(); } catch (_) {} delete this.peerAudioSources[peerId]; }
-  }
 
   updatePeerUI(peerId) {
     const state = this.peerStates[peerId] || {};
