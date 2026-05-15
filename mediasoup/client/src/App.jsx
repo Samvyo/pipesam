@@ -29,9 +29,51 @@ function App() {
   const [chat, setChat] = useState([]);
   const [users, setUsers] = useState([]);
   const [peerState, setPeerState] = useState({});
+
   const [token, setToken] = useState("");
   const [joined, setJoined] = useState(false);
   const [myPeerId, setMyPeerId] = useState("");
+
+  useEffect(() => {
+  const savedToken    = sessionStorage.getItem("token");
+  const savedUsername = sessionStorage.getItem("username");
+  const savedRoomId   = sessionStorage.getItem("roomId");
+  const didJoin       = sessionStorage.getItem("didJoin");
+
+  // always restore form fields
+  if (savedToken)    setToken(savedToken);
+  if (savedUsername) setUsername(savedUsername);
+  if (savedRoomId)   setRoomId(savedRoomId);
+
+  // ONLY auto-rejoin if THIS specific tab previously clicked Join
+  // sessionStorage is isolated per tab — not shared between tabs
+  if (!didJoin || !savedToken || !savedUsername || !savedRoomId) {
+    console.log("🆕 Fresh tab — showing form, not auto-joining");
+    return;   // ← STOP HERE for new tabs
+  }
+
+  // This tab had an active session — check Redis for recovery
+  const protocol = window.location.protocol;
+  fetch(`${protocol}//${window.location.hostname}:3000/admin/redis/${savedRoomId}`)
+    .then(r => r.json())
+    .then(state => {
+      const isInRoom = Array.isArray(state.peers) 
+                       && state.peers.includes(savedUsername);
+      if (isInRoom) {
+        console.log("♻️ Same tab refresh — auto-rejoining");
+        myPeerIdRef.current = savedUsername;
+        usernameRef.current = savedUsername;
+        setMyPeerId(savedUsername);
+        setJoined(true);
+        room.joinRoom(null, savedRoomId);
+      } else {
+        // not in Redis = genuine new session
+        sessionStorage.removeItem("didJoin");
+        console.log("👤 Not in Redis — waiting for Join click");
+      }
+    })
+    .catch(() => sessionStorage.removeItem("didJoin"));
+}, []);
 
   const [streams, setStreams] = useState({});
   const [audioStreams, setAudioStreams] = useState({});
@@ -50,6 +92,14 @@ function App() {
   // ─── callbacks ───────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!room) return;
+
+    room.onLocalStream = (stream) => {
+      if (videoRef.current && stream) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play().catch(() => { });
+      }
+    };
+
 
     room.onLocalScreenStream = (stream) => setLocalScreenStream(stream || null);
     room.onMessage = () => {};
@@ -186,7 +236,7 @@ function App() {
       }
 
       // 🔥 also prepare for join
-      room.localStream = streamRef;
+      // room.localStream = streamRef;
 
     } catch (e) {
       console.warn("Camera preview failed:", e.message);
@@ -198,7 +248,7 @@ function App() {
   return () => {
     // ❌ DO NOT stop tracks here
   };
-}, [navigate]); // 🔥 important change
+}, []); // 🔥 important change
 
   // ─── leave handler ────────────────────────────────────────────────────────────
   const handleLeave = () => {
@@ -220,9 +270,10 @@ function App() {
     setPeerState({});
 
     // 🔥 CLEAR INPUTS
-    setToken("");
-    setUsername("");
-    setRoomId("");
+    sessionStorage.removeItem("token");
+    sessionStorage.removeItem("username");
+    sessionStorage.removeItem("roomId");
+    sessionStorage.removeItem("didJoin");
 
     // 🔥 FORCE NAVIGATION
     navigate('/feedback', { replace: true });
@@ -286,13 +337,17 @@ function App() {
           if (!payload) { alert("❌ Invalid token"); return; }
           if (String(payload.username) !== String(username)) { alert("❌ Username mismatch"); return; }
           if (String(payload.roomId) !== String(roomId)) { alert("❌ RoomId mismatch"); return; }
-          localStorage.setItem("token", token);
+          sessionStorage.setItem("token", token);
+          sessionStorage.setItem("username", username);
+          sessionStorage.setItem("roomId", roomId);
+          sessionStorage.setItem("didJoin", "1");
 
           usernameRef.current = username;   // ← MUST be BEFORE joinRoom
           setMyPeerId(username);
           myPeerIdRef.current = username;
           setJoined(true);
           room.joinRoom(null, roomId);
+          sessionStorage.setItem("didJoin", "1"); 
           // setIsModerator(true); 
         }}>Join</button>
       </div>

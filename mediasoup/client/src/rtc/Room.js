@@ -77,7 +77,7 @@ export default class Room {
   }
 
   connectAndJoin() {
-    const token = localStorage.getItem("token");
+    const token = sessionStorage.getItem("token");
 
     // ✅ Step 1: prevent multiple connections
   if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
@@ -229,27 +229,49 @@ export default class Room {
       if (data.type === 'state-sync') {
         this.peers = new Set(data.payload.peers || []);
         this.onPeersUpdate?.([...this.peers]);
+
         this.renderMessages(data.payload.messages);
         if (this.peers.size < 2) this.addMsg("Waiting for another user...");
 
+        // set defaults for all peers first
         for (const pid of this.peers) {
           if (pid !== this.peerId) {
-          this.peerStates[pid] = { muted: false, videoOff: false, isScreenSharing: false };
+            this.peerStates[pid] = { muted: false, videoOff: false, isScreenSharing: false };
           }
         }
 
+        // overwrite with actual Redis state for EVERYONE
         if (data.payload.muteStates) {
           Object.keys(data.payload.muteStates).forEach(pid => {
-            this.peerStates[pid] = { ...(this.peerStates[pid] || {}), ...data.payload.muteStates[pid] };
-            this.updatePeerUI(pid);
+            const savedState = data.payload.muteStates[pid];
+
+            if (pid === this.peerId) {
+              // your own state — apply to actual tracks
+              if (savedState.muted !== undefined) {
+                this.localStream?.getAudioTracks().forEach(t => { t.enabled = !savedState.muted; });
+                this.onPeerStateChange?.(this.peerId, { muted: savedState.muted });
+              }
+              if (savedState.videoOff !== undefined) {
+                this.localStream?.getVideoTracks().forEach(t => { t.enabled = !savedState.videoOff; });
+                this.onPeerStateChange?.(this.peerId, { videoOff: savedState.videoOff });
+              }
+            } else {
+              // other peers — update display state and UI
+              this.peerStates[pid] = { ...(this.peerStates[pid] || {}), ...savedState };
+              this.updatePeerUI(pid);
+            }
           });
         }
+
         if (data.payload.screenSharers) {
           data.payload.screenSharers.forEach(pid => {
             this.screenSharers[pid] = true;
             this.peerStates[pid] = { ...(this.peerStates[pid] || {}), isScreenSharing: true };
             this.updatePeerUI(pid);
           });
+        }
+        if (this.localStream) {
+          this.onLocalStream?.(this.localStream);  // ← ADD HERE
         }
         this.initTransport();
       }
@@ -327,6 +349,9 @@ export default class Room {
     }
 
       if (data.type === 'hello') this.addMsg(`${data.payload} says hello`);
+      if (data.type === 'chat') {
+        this.addChatMsg(`${data.from}: ${data.text}`);
+      }
 
       // ✅ Server created transport — set up client side
      if (data.type === 'transport-created') {
@@ -467,7 +492,58 @@ export default class Room {
     }
   }
 
-    this.ws.onclose = () => this.setStatus(false);
+    this.ws.onclose = async () => {
+      this.setStatus(false);
+      console.log("⚠️ WebSocket disconnected");
+
+      if (this._reconnecting) return;
+      this._reconnecting = true;
+
+      // close mediasoup objects
+      try { this.sendTransport?.close(); } catch (e) { }
+      try { this.recvTransport?.close(); } catch (e) { }
+
+      // reset ALL state
+      this.sendTransport = null;
+      this.recvTransport = null;
+      this.device = null;
+      this._produced = false;
+      this._rtpSent = false;
+      this.localStream = null;   // ✅ already there
+      this.dataProducer = null;   // ← ADD
+      this.dataConsumers = new Map(); // ← ADD
+
+      // clear stale remote UI
+      this.peers.forEach(peerId => {
+        if (peerId !== this.peerId) {
+          this.onTrack?.(peerId, null);
+          this.onAudioTrack?.(peerId, null);
+          this.onScreenShare?.(peerId, null);
+        }
+      });
+
+      console.log("♻️ mediasoup state reset");
+
+      setTimeout(async () => {                        // ← async
+        console.log("🔄 Attempting reconnect...");
+
+        // re-acquire camera + mic
+        if (!this.localStream) {                      // ← ADD
+          try {
+            this.localStream = await navigator.mediaDevices.getUserMedia({
+              video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+              audio: true
+            });
+            this.onLocalStream?.(this.localStream);
+          } catch (e) {
+            console.error("❌ Failed to re-acquire media:", e);
+          }
+        }
+
+        this.connectAndJoin();
+        this._reconnecting = false;
+      }, 2000);
+    };
   }
 
   async joinRoom(user, roomId) {
@@ -477,7 +553,7 @@ export default class Room {
     }
 
   // ❗ ALWAYS take identity from token (not UI)
-    const token = localStorage.getItem("token");
+    const token = sessionStorage.getItem("token");
 
     if (!token) {
       console.error("❌ No token found");
@@ -506,7 +582,7 @@ export default class Room {
         audio: true
       });
 
-      this.onLocalStream?.(this.localStream);
+      this.onLocalStream?.(this.localStream); 
     }
     this.connectAndJoin();
     // this.startStatsMonitoring();
@@ -618,25 +694,25 @@ export default class Room {
   }
 
   renderMessages(msgs = []) {
-    msgs.forEach(m => {
-      if (m.type === 'hello') {
-        this.onMessage?.(`${m.payload} says hello`);
-      }
-    });
-  }
+  msgs.forEach(m => {
+    if (m.type === 'hello') {
+      this.onMessage?.(`${m.payload} says hello`);
+    } else if (m.type === 'chat') {
+      // restore chat history from Redis on rejoin
+      this.onChat?.(`${m.from}: ${m.text}`);
+    }
+  });
+}
 
 
   sendChat(msg) {
-    if (!msg) return;
+  if (!msg) return;
 
-    this.addChatMsg(`You: ${msg}`);
+  this.addChatMsg(`You: ${msg}`);
 
-    if (this.dataProducer) {
-      this.dataProducer.send(msg);
-    } else {
-      console.warn("⚠️ DataProducer not ready");
-    }
-  }
+  // send via WebSocket so server saves to Redis
+  this._send({ type: 'chat', text: msg, from: this.peerId });
+}
 
   addChatMsg(msg) {
     this.onChat?.(msg);
