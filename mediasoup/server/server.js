@@ -67,6 +67,54 @@ class WorkerPool {
   }
 }
 
+class RateLimiter {
+  constructor() {
+    this.peers = new Map();
+  }
+
+  add(peerId) {
+    this.peers.set(peerId, {
+      count: 0,
+      windowStart: Date.now(),
+    });
+  }
+
+  check(peerId) {
+    const peer = this.peers.get(peerId);
+
+    if (!peer) return true;
+
+    const now = Date.now();
+
+    // Reset count every 5 seconds
+    if (now - peer.windowStart > WINDOW_MS) {
+      peer.count = 0;
+      peer.windowStart = now;
+    }
+
+    peer.count++;
+
+    console.log(
+      `[rate-limit] ${peerId} count=${peer.count}`
+    );
+
+    // Block after 10 requests
+    if (peer.count >= RATE_LIMIT) {
+      console.warn(
+        `[rate-limit] BLOCKED ${peerId}`
+      );
+
+      return false;
+    }
+
+    return true;
+  }
+
+  remove(peerId) {
+    this.peers.delete(peerId);
+  }
+}
+
 
 class Room {
   constructor(roomId) {
@@ -234,6 +282,7 @@ class RoomManager {
 
 const workerPool  = new WorkerPool();
 const roomManager = new RoomManager(workerPool);
+const rateLimiter = new RateLimiter();
 
 // Root route
 app.get("/token", (req, res) => {
@@ -354,6 +403,24 @@ app.get('/metrics', async (req, res) => {
   res.end(await metrics.register.metrics());
 });
 
+app.get('/health', (req, res) => {
+  const workerStatuses = workerPool.workers.map((entry, i) => ({
+    index: i,
+    alive: !entry.worker.closed,   // mediasoup sets this when worker dies
+    roomCount: entry.roomCount,
+  }));
+
+  const allHealthy = workerStatuses.every(w => w.alive);
+
+  res.status(allHealthy ? 200 : 503).json({
+    status: allHealthy ? 'ok' : 'degraded',
+    workers: workerStatuses,
+    totalRooms: roomManager.rooms.size,
+    totalPeers: [...roomManager.rooms.values()]
+      .reduce((sum, room) => sum + room.peers.size, 0),
+    uptime: process.uptime(),
+  });
+});
 
 // server/index.js — after GET /admin/consumers
 
@@ -442,46 +509,12 @@ const server = https.createServer(sslOptions, app);
 // Attach WebSocket
 const wss = new WebSocket.Server({ noServer: true });
 
-
-
-// const rooms = new Map();
-
-// async function getRoom(roomId) {
-//   if (!rooms.has(roomId)) {
-//     const room = new Room(roomId);
-
-//     // get the worker we created at startup
-//     const worker = workers.get("worker-1");
-
-//     // create router for this room
-//     // router needs to know which codecs (video/audio formats) it supports
-//     room.router = await worker.createRouter({
-//       mediaCodecs: [
-//         {
-//           kind: "audio",
-//           mimeType: "audio/opus",  // standard audio codec for WebRTC
-//           clockRate: 48000,        // 48kHz sample rate
-//           channels: 2              // stereo
-//         },
-//         {
-//           kind: "video",
-//           mimeType: "video/VP8",   // standard video codec for WebRTC
-//           clockRate: 90000         // standard video clock rate
-//         }
-//       ]
-//     });
-
-//     console.log(`✅ Router created for room: ${roomId}`);
-//     rooms.set(roomId, room);
-//   }
-//   return rooms.get(roomId);
-// }
-
-// server/index.js — REPLACE your existing attachAdaptiveLayerSwitching
-
 const SCORE_LOW_THRESHOLD  = 5;
 const SCORE_HIGH_THRESHOLD = 8;
 const UPGRADE_COOLDOWN_MS  = 8000;
+
+const RATE_LIMIT      = 10;
+const WINDOW_MS = 5000;
 
 function attachAdaptiveLayerSwitching(consumer, room) { 
   if (consumer.kind !== 'video') return;
@@ -761,8 +794,25 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    if (
+      ws.peerId &&
+      data.type !== 'rtp-capabilities'
+    ) {
+
+      const allowed = rateLimiter.check(ws.peerId);
+
+      if (!allowed) {
+
+        ws.send(JSON.stringify({
+          type: 'rate-limited',
+          message: 'Too many requests — slow down',
+        }));
+
+        return;
+      }
+    }
+
     // ✅ NEW: HANDLE RTP CAPABILITIES FIRST
-    // CURRENT (3 lines):
 
 // REPLACE WITH:
 if (data.type === 'rtp-capabilities') {
@@ -788,6 +838,7 @@ if (data.type === 'rtp-capabilities') {
       ws.peerId = peerId;
 
       const isRecovering = room.addPeer(peerId, ws);
+      rateLimiter.add(peerId);
 
       // 🔥 refresh recovery cleanup
       if (isRecovering) {
@@ -1379,17 +1430,6 @@ if (data.type === 'rtp-capabilities') {
   const room = roomManager.get(ws.roomId);
   if (!room) return;
 
-  // const peers = room.listPeers();
-
-  // // first peer in the list is the moderator
-  // if (peers[0] !== ws.peerId) {
-  //   ws.send(JSON.stringify({
-  //     type: 'recording-error',
-  //     message: 'Only the moderator can start recording'
-  //   }));
-  //   return;
-  // }
-
   if (room.ffmpegProcess) {
     ws.send(JSON.stringify({
       type: 'recording-error',
@@ -1502,6 +1542,7 @@ else if (data.type === 'stop-recording') {
     }
 
     console.log(`❌ Permanent cleanup for ${pId}`);
+    rateLimiter.remove(pId);
 
     metrics.peerLeaveTotal.inc();
     // 🔥 1. CLOSE PRODUCERS
@@ -1620,4 +1661,88 @@ else if (data.type === 'stop-recording') {
   });
 })();
 
-// console.log("Server running on ws://localhost:3000");
+async function gracefulShutdown(signal) {
+
+  console.log(`\n⚠️ Received ${signal}`);
+  console.log("🛑 Gracefully shutting down...");
+
+  try {
+
+    // ─────────────────────────────────────────────
+    // Notify all connected clients first
+    // ─────────────────────────────────────────────
+    wss.clients.forEach(client => {
+
+      if (client.readyState === WebSocket.OPEN) {
+
+        client.send(JSON.stringify({
+          type: 'server-shutdown',
+          message: 'Server is shutting down'
+        }));
+      }
+    });
+
+    // small delay so frontend receives message
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // ─────────────────────────────────────────────
+    // Close WebSocket server
+    // ─────────────────────────────────────────────
+    wss.close(() => {
+      console.log("✅ WebSocket server closed");
+    });
+
+    // ─────────────────────────────────────────────
+    // Close HTTPS server
+    // ─────────────────────────────────────────────
+    server.close(() => {
+      console.log("✅ HTTPS server closed");
+    });
+
+    // ─────────────────────────────────────────────
+    // Stop active recordings
+    // ─────────────────────────────────────────────
+    for (const [, room] of roomManager.list()) {
+
+      if (room.ffmpegProcess) {
+
+        room.ffmpegProcess.kill('SIGINT');
+
+        console.log(
+          `🛑 Recording stopped for room ${room.roomId}`
+        );
+      }
+
+      try { room.recordingConsumer?.close(); } catch(e) {}
+      try { room.recordingTransport?.close(); } catch(e) {}
+      try { room.recordingAudioConsumer?.close(); } catch(e) {}
+      try { room.recordingAudioTransport?.close(); } catch(e) {}
+
+      room.recordingConsumer = null;
+      room.recordingTransport = null;
+      room.recordingAudioConsumer = null;
+      room.recordingAudioTransport = null;
+    }
+
+    // ─────────────────────────────────────────────
+    // Close mediasoup workers
+    // ─────────────────────────────────────────────
+    for (const entry of workerPool.workers) {
+
+      await entry.worker.close();
+    }
+
+    console.log("✅ mediasoup workers closed");
+
+    process.exit(0);
+
+  } catch (err) {
+
+    console.error("❌ Shutdown error:", err);
+
+    process.exit(1);
+  }
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));

@@ -112,20 +112,6 @@ const consumerScore = new client.Gauge({
   registers: [register],
 });
 
-const transportRecvBitrate = new client.Gauge({
-  name: 'mediasoup_transport_recv_bitrate',
-  help: 'Transport receive bitrate',
-  labelNames: ['room_id', 'direction'],
-  registers: [register],
-});
-
-const transportSendBitrate = new client.Gauge({
-  name: 'mediasoup_transport_send_bitrate',
-  help: 'Transport send bitrate',
-  labelNames: ['room_id', 'direction'],
-  registers: [register],
-});
-
 const transportRtt = new client.Gauge({
   name: 'mediasoup_transport_rtt_ms',
   help: 'Transport RTT',
@@ -142,8 +128,8 @@ async function collectRoomMetrics(workerPool, roomManager) {
   producerBitrate.reset();
   consumerBitrate.reset();
   consumerScore.reset();
-  transportRecvBitrate.reset();
-  transportSendBitrate.reset();
+  // transportRecvBitrate.reset();
+  // transportSendBitrate.reset();
   transportRtt.reset();
 
   activePeers.reset();
@@ -386,21 +372,21 @@ async function collectRoomMetrics(workerPool, roomManager) {
 
           for (const s of stats) {
 
-            transportSendBitrate.set(
-              {
-                room_id: room.roomId,
-                direction: dir
-              },
-              s.sendBitrate || 0
-            );
+            // transportSendBitrate.set(
+            //   {
+            //     room_id: room.roomId,
+            //     direction: dir
+            //   },
+            //   s.sendBitrate || 0
+            // );
 
-            transportRecvBitrate.set(
-              {
-                room_id: room.roomId,
-                direction: dir
-              },
-              s.recvBitrate || 0
-            );
+            // transportRecvBitrate.set(
+            //   {
+            //     room_id: room.roomId,
+            //     direction: dir
+            //   },
+            //   s.recvBitrate || 0
+            // );
 
             transportRtt.set(
               {
@@ -440,7 +426,7 @@ module.exports = {
   producerBitrate,
   consumerBitrate,
   consumerScore,
-  transportRecvBitrate,
-  transportSendBitrate,
+  // transportRecvBitrate,
+  // transportSendBitrate,
   transportRtt,
 };

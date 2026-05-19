@@ -7,23 +7,12 @@ export default class Room {
     this.peerId           = null;
     this.roomId           = null;
 
-    // this.peerConnections  = {};
     this.localStream      = null;
     this.screenTrack      = null;
     this.peers            = new Set();
     this.peerStates       = {};
     this.screenSharers = {};
     this.statsCache       = {};
-    // this.dataChannels     = {};
-    // this.canvas           = null;
-    // this.ctx              = null;
-    // this.mixedStream      = null;
-    // this.recorder         = null;
-    // this.recordedChunks   = [];
-    // this.recordingRAF     = null;
-    // this.audioCtx         = null;
-    // this.audioDest        = null;
-    // this.peerAudioSources = {};
     this._connectQueue    = Promise.resolve();
 
     this.device = null;  
@@ -55,6 +44,8 @@ export default class Room {
 
     this.dataProducer = null;
     this.dataConsumers = new Map();
+    this.isRateLimited = false;
+    this._serverShutdown = false;
   }
 
   setStatus(val) {
@@ -62,10 +53,16 @@ export default class Room {
     this.onMessage?.(val ? "Connected" : "Disconnected");
   }
   _send(data) {
+
+    if (this.isRateLimited) {
+      console.warn("🚫 Rate limited — request blocked:", data.type);
+      return;
+    }
+
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
     } else {
-      console.warn("⚠️ WebSocket not ready, skipping:", data.type);
+      console.warn("⚠️ WebSocket not ready:", data.type);
     }
   }
   
@@ -108,8 +105,123 @@ export default class Room {
 
     this.ws.onmessage = async (event) => {
       const data = JSON.parse(event.data);
+
+      if (data.type === 'server-shutdown') {
+
+        if (this._serverShutdown) return;
+
+        this._serverShutdown = true;
+
+        console.log("🛑 Server shutdown received");
+
+        alert("Server shutting down");
+
+        // ─────────────────────────────────────
+        // CLOSE PRODUCERS
+        // ─────────────────────────────────────
+
+        try { this.videoProducer?.close(); } catch (e) { }
+        try { this.screenProducer?.close(); } catch (e) { }
+        try { this.dataProducer?.close(); } catch (e) { }
+
+        this.videoProducer = null;
+        this.screenProducer = null;
+        this.dataProducer = null;
+
+        // ─────────────────────────────────────
+        // CLOSE DATA CONSUMERS
+        // ─────────────────────────────────────
+
+        for (const [, dc] of this.dataConsumers) {
+          try { dc.close(); } catch (e) { }
+        }
+
+        this.dataConsumers.clear();
+
+        // ─────────────────────────────────────
+        // CLOSE TRANSPORTS
+        // ─────────────────────────────────────
+
+        try { this.sendTransport?.close(); } catch (e) { }
+        try { this.recvTransport?.close(); } catch (e) { }
+
+        this.sendTransport = null;
+        this.recvTransport = null;
+
+        // ─────────────────────────────────────
+        // STOP LOCAL MEDIA TRACKS
+        // ─────────────────────────────────────
+
+        this.localStream?.getTracks()?.forEach(track => {
+          try { track.stop(); } catch (e) { }
+        });
+
+        this.screenTrack?.stop?.();
+
+        this.localStream = null;
+        this.screenTrack = null;
+
+        // ─────────────────────────────────────
+        // CLEAR STATES
+        // ─────────────────────────────────────
+
+        this.peers.clear();
+
+        this.peerStates = {};
+        this.screenSharers = {};
+        this.statsCache = {};
+        this.remoteStreams = {};
+
+        // ─────────────────────────────────────
+        // RESET MEDIASOUP FLAGS
+        // ─────────────────────────────────────
+
+        this.device = null;
+
+        this._produced = false;
+        this._rtpSent = false;
+
+        // ─────────────────────────────────────
+        // CLOSE WEBSOCKET
+        // ─────────────────────────────────────
+
+        if (this.ws) {
+          this.ws.onclose = null;
+          this.ws.close();
+          this.ws = null;
+        }
+
+        // ─────────────────────────────────────
+        // UPDATE UI
+        // ─────────────────────────────────────
+
+        this.onPeersUpdate?.([]);
+        this.onMessage?.("Disconnected from server");
+
+        this.setStatus(false);
+
+        console.log("✅ Client cleanup complete");
+
+        window.location.reload();
+
+        return;
+      }
       console.log(`[WS @ ${this.peerId}]`, data.type, "from:", data.from || "server");
-      
+      if (data.type === "rate-limited") {
+
+        this.isRateLimited = true;
+
+        alert(data.message);
+
+        console.warn("🚫 Rate limit activated");
+
+        setTimeout(() => {
+          this.isRateLimited = false;
+          console.log("✅ Rate limit reset");
+        }, 30000);
+
+        return;
+      }
       if (data.type === 'transport-connected') {
 
         if (data.direction === 'send') {
@@ -493,6 +605,11 @@ export default class Room {
   }
 
     this.ws.onclose = async () => {
+      if (this._serverShutdown) {
+        console.log("🛑 Server shutdown — reconnect skipped");
+        return;
+      }
+
       this.setStatus(false);
       console.log("⚠️ WebSocket disconnected");
 
@@ -590,7 +707,7 @@ export default class Room {
 
   sendHello() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: 'hello' }));
+    this._send({ type: 'hello' });
   }
 
   toggleAudio() {
@@ -599,7 +716,11 @@ export default class Room {
     this.onPeerStateChange?.(this.peerId, {
       muted
     });
-    this.ws?.send(JSON.stringify({ type: "mute-status", from: this.peerId, muted }));
+    this._send({
+      type: "mute-status",
+      from: this.peerId,
+      muted
+    });
     // const localLabel = document.getElementById("localLabel");
     // if (localLabel) localLabel.innerText = muted ? `You (${this.peerId}) 🔇` : `You (${this.peerId}) 🔊`;
   }
@@ -610,7 +731,11 @@ export default class Room {
     this.onPeerStateChange?.(this.peerId, {
       videoOff: off
     });
-    this.ws?.send(JSON.stringify({ type: "video-status", from: this.peerId, videoOff: off }));
+    this._send({
+      type: "video-status",
+      from: this.peerId,
+      videoOff: off
+    });
   }
 
   async toggleScreenShare() {
@@ -654,7 +779,10 @@ export default class Room {
     this.screenProducer = null;
   }
 
-  this.ws?.send(JSON.stringify({ type: "screen-share-stop", from: this.peerId }));
+    this._send({
+      type: "screen-share-stop",
+      from: this.peerId
+    });
 
   delete this.screenSharers[this.peerId];
   this.peerStates[this.peerId] = { ...(this.peerStates[this.peerId] || {}), isScreenSharing: false };
