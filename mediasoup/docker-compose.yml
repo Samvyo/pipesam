@@ -1,0 +1,76 @@
+services:
+
+  client:
+    build: ./client
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./certs:/certs
+    depends_on:
+      - signaling
+
+  signaling:
+    build: ./server
+    network_mode: "host"
+    volumes:
+      - ./certs:/certs
+      - ./recordings:/app/recordings
+    environment:
+      - ANNOUNCED_IP=192.168.29.230
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+
+  coturn:
+    image: coturn/coturn
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+    command: >
+      -n
+      --log-file=stdout
+      --min-port=49152
+      --max-port=49200
+      --realm=webrtc.local
+      --user=test:test
+      --no-cli
+      --no-multicast-peers
+      --fingerprint
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  # ── NEW: Prometheus ──────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── NEW: Grafana ─────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+volumes:
+  redis_data:
+  prometheus_data:   
+  grafana_data:     
