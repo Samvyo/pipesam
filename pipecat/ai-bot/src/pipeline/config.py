@@ -19,6 +19,12 @@ class Config:
     SAMPLE_RATE: int = 16000
     CHUNK: int = 1024
 
+    # Signalling settings
+    SIGNALLING_URL: str = os.getenv("SIGNALLING_URL", "wss://192.168.29.230:3000")
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+    BOT_ROOM_ID: str = os.getenv("BOT_ROOM_ID", "testroom")
+    BOT_PRODUCER_ID: str = os.getenv("BOT_PRODUCER_ID", "")
+
     # System prompt — tells Claude how to behave
     SYSTEM_PROMPT: str = """You are a helpful voice assistant.
     Reply in MAXIMUM 1 short sentence under 20 words.
@@ -31,6 +37,10 @@ class Config:
             missing.append("DEEPGRAM_API_KEY")
         if not cls.ANTHROPIC_API_KEY:
             missing.append("ANTHROPIC_API_KEY")
+        if not cls.BOT_TOKEN:
+            missing.append("BOT_TOKEN")
+        if not cls.BOT_PRODUCER_ID:
+            missing.append("BOT_PRODUCER_ID")
         if missing:
             raise ValueError(f"Missing in .env: {', '.join(missing)}")
         print("✅ Config OK - all keys found")

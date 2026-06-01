@@ -1,0 +1,160 @@
+import asyncio
+import websockets
+import json
+import ssl
+from loguru import logger
+
+# Handles WebSocket signalling between the Python bot and MediaSoup server.
+class BotSignalling:
+    def __init__(self, server_url: str, token: str, rtp_port: int):
+        self.server_url = server_url
+        self.token      = token
+        self.rtp_port   = rtp_port
+        self.ws         = None
+        self.transport_id  = None
+        self.consumer_id   = None
+        self.sender        = None
+
+        # bot.py waits on this before reading RTP packets
+        self.ready = asyncio.Event()
+
+    # Establish a secure WebSocket connection to the signalling server.
+    async def connect(self):
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode    = ssl.CERT_NONE
+
+        url = f"{self.server_url}?token={self.token}"
+        self.ws = await websockets.connect(url, ssl=ssl_ctx)
+        logger.info("✅ Bot connected to signalling server")
+
+    # Configure MediaSoup consumer transport and start receiving browser audio via RTP.
+    async def setup(self, room_id: str, producer_id: str):
+
+        # RPC 1: Join the room so the server can register the bot as a room participant
+        await self._send({'type': 'join-room'})
+        logger.info(f"📥 Bot joined room: {room_id}")
+
+        # RPC 2: Create a PlainTransport that MediaSoup will use to send RTP audio to the bot.
+        await self._send({'type': 'create-bot-transport'})
+        response = await self._wait_for('bot-transport-created')
+        self.transport_id = response['id']
+        logger.info(f"🔌 Consumer transport created: {self.transport_id} server at {response['ip']}:{response['port']}")
+
+        # Connect the MediaSoup transport to the bot's RTP receiver UDP port.
+        await self._send({
+            'type':        'connect-bot-transport',
+            'transportId': self.transport_id,
+            'ip':          '127.0.0.1',
+            'port':        self.rtp_port,
+        })
+        await self._wait_for('bot-transport-connected')
+        logger.info(f"✅ Consumer transport connected → port {self.rtp_port}")
+
+
+        # RPC 3: Create a consumer for the browser's audio producer on the bot transport.
+        await self._send({
+            'type':        'create-bot-consumer',
+            'transportId': self.transport_id,
+            'producerId':  producer_id,
+        })
+        response = await self._wait_for('bot-consumer-created')
+        self.consumer_id = response['consumerId']
+        logger.info(
+            f"🎧 Consumer created: {self.consumer_id} "
+            f"kind={response['kind']}"
+        )
+
+        # RPC 4: Resume the consumer so RTP packets begin flowing from MediaSoup to the bot.
+        await self._send({
+            'type':        'resume-bot-consumer',
+            'transportId': self.transport_id,
+        })
+        await self._wait_for('bot-consumer-resumed')
+        logger.info("▶️  RTP flowing — browser audio arriving at port 55000")
+
+        # Signal that RTP is ready and the bot can begin reading audio packets.
+        self.ready.set()
+
+    # Configure MediaSoup producer transport and start sending bot audio via RTP.
+    async def setup_send_path(self):
+        from .rtp_sender import RTPSender, make_rtp_parameters
+
+        # RPC 5: Create a PlainTransport that receives RTP audio from the bot.
+        await self._send({
+            'type': 'create-bot-producer-transport'
+        })
+        msg = await self._wait_for('bot-producer-transport-created')
+
+        transport_id = msg['id']
+        ip           = msg['ip']
+        port         = msg['port']
+        logger.info(f"🔌 Producer transport created: {ip}:{port}")
+
+        # Create RTP sender using the transport IP and port provided by MediaSoup
+        self.sender = RTPSender(host=ip, port=port)
+        self.sender.start()
+        logger.info("📡 Warming up comedia — sending 5 packets...")
+
+        # Send initial RTP packets so MediaSoup can learn the bot's UDP source address.
+        for _ in range(5):
+            self.sender.send_tone_frame(freq=440.0)
+            await asyncio.sleep(0.02)
+
+        # RPC 6: Create a MediaSoup producer for the bot's RTP audio stream.
+        await self._send({
+            'type':          'create-bot-producer',
+            'transportId':   transport_id,
+            'rtpParameters': make_rtp_parameters(
+                ssrc=self.sender.ssrc,
+                payload_type=120
+            ),
+        })
+        msg = await self._wait_for('bot-producer-created')
+        logger.info(f"🎵 Producer created: {msg['producerId']}")
+
+        # Start continuous RTP audio transmission in a background task.
+        asyncio.create_task(
+            self.sender.stream_tone(freq=440.0)
+        )
+    
+    # Continuously listen for signalling messages from the server.
+    async def listen(self):
+        try:
+            async for raw in self.ws:
+                msg = json.loads(raw)
+                logger.debug(f"[signalling] ← {msg['type']}")
+        except Exception as e:
+            logger.warning(f"[signalling] connection closed: {e}")
+
+    # Send a JSON signalling message to the server over WebSocket. 
+    async def _send(self, msg: dict):
+        """Send one JSON message to server."""
+        await self.ws.send(json.dumps(msg))
+        logger.debug(f"[signalling] → {msg['type']}")
+
+    # Wait for a specific server response while ignoring unrelated messages.
+    async def _wait_for(self, msg_type: str) -> dict:
+        while True:
+            raw = await self.ws.recv()
+            msg = json.loads(raw)
+            logger.info(f"[signalling] ← {msg}")
+
+            if msg['type'] == msg_type:
+                return msg
+
+            if msg['type'] == 'bot-error':
+                logger.error(
+                    f"❌ Server error: {msg.get('message')}"
+                )
+                raise Exception(
+                    f"Server error: {msg.get('message')}"
+                )
+       
+    # Close RTP sender and WebSocket connection during shutdown.  
+    async def close(self):
+        if self.sender:
+            self.sender.close()
+        if self.ws:
+            await self.ws.close()
+            logger.info("🔌 Signalling connection closed")

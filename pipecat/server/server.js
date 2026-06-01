@@ -133,6 +133,8 @@ class Room {
     this.producers = new Map();
     this.peerProducers = new Map();
     this.consumers = new Map();
+    this.botTransports = new Map();
+    this.botProducerTransports = new Map();
   }
 
   addPeer(peerId, ws) {
@@ -794,20 +796,26 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    const botTypes = new Set([
+      'create-bot-transport',
+      'connect-bot-transport',
+      'create-bot-consumer',
+      'resume-bot-consumer',
+      'create-bot-producer-transport',
+      'create-bot-producer',
+    ]);
+
     if (
       ws.peerId &&
-      data.type !== 'rtp-capabilities'
+      data.type !== 'rtp-capabilities' &&
+      !botTypes.has(data.type)
     ) {
-
       const allowed = rateLimiter.check(ws.peerId);
-
       if (!allowed) {
-
         ws.send(JSON.stringify({
           type: 'rate-limited',
           message: 'Too many requests — slow down',
         }));
-
         return;
       }
     }
@@ -1389,6 +1397,237 @@ if (data.type === 'rtp-capabilities') {
       console.log(`▶️  Consumer resumed: ${data.consumerId}`);
     }
 
+    else if (data.type === 'create-bot-transport') {
+      // Step 1: get the room this peer is in
+      const room = roomManager.get(ws.roomId);
+      if (!room?.router) return;
+
+      // Step 2: create the PlainTransport on the router
+      const transport = await room.router.createPlainTransport({
+        listenIp: { ip: '127.0.0.1' },
+        rtcpMux: true,
+        comedia: false,
+      });
+
+      // Step 3: store transport on the room so RPC 2 and 3 can find it
+      room.botTransports.set(transport.id, {
+        transport,
+        peerId: ws.peerId,
+        consumer: null
+      });
+
+      // Step 4: send the server's IP and port back to the bot
+      ws.send(JSON.stringify({
+        type: 'bot-transport-created',
+        id: transport.id,
+        ip: transport.tuple.localIp,
+        port: transport.tuple.localPort,
+        rtcpPort: transport.rtcpTuple?.localPort,
+      }));
+    }
+
+    else if (data.type === 'connect-bot-transport') {
+      const room = roomManager.get(ws.roomId);
+      if (!room) return;
+
+      console.log(`🔌 connect-bot-transport: looking for ${data.transportId} in botTransports size=${room.botTransports.size}`);
+
+      // Look up the transport by the ID the bot sent us
+      const entry = room.botTransports?.get(data.transportId);
+      if (!entry) {
+        console.log(`❌ Transport not found: ${data.transportId}`);
+        ws.send(JSON.stringify({
+          type: 'bot-error',
+          message: 'Transport not found: ' + data.transportId
+        }));
+        return;
+      }
+
+      // Tell mediasoup where to send RTP — the bot's IP and port
+      await entry.transport.connect({
+        ip: data.ip,
+        port: data.port,
+      });
+
+      ws.send(JSON.stringify({
+        type: 'bot-transport-connected',
+        transportId: data.transportId
+      }));
+    }
+
+    else if (data.type === 'create-bot-consumer') {
+      const room = roomManager.get(ws.roomId);
+      if (!room) return;
+
+      // Look up the transport
+      const entry = room.botTransports?.get(data.transportId);
+      if (!entry) {
+        ws.send(JSON.stringify({ type: 'bot-error', message: 'Transport not found' }));
+        return;
+      }
+
+      // Look up the producer the bot wants to consume
+      const producerEntry = room.producers?.get(data.producerId);
+      if (!producerEntry) {
+        ws.send(JSON.stringify({ type: 'bot-error', message: 'Producer not found' }));
+        return;
+      }
+
+      // Create the consumer — this starts copying RTP to the bot
+      const consumer = await entry.transport.consume({
+        producerId: data.producerId,
+        rtpCapabilities: room.router.rtpCapabilities,
+        paused: true,
+      });
+
+      console.log(
+        'BOT CONSUMER CREATED',
+        consumer.id,
+        consumer.kind,
+        consumer.producerId
+      );
+
+      // Save the consumer for cleanup
+      entry.consumer = consumer;
+
+      // Send back everything the bot needs to decode the packets
+      ws.send(JSON.stringify({
+        type: 'bot-consumer-created',
+        consumerId: consumer.id,
+        kind: consumer.kind,
+        rtpParameters: consumer.rtpParameters,
+      }));
+    }
+    
+    // ✅ NEW BLOCK — bot signals it is ready, resume RTP flow
+    else if (data.type === 'resume-bot-consumer') {
+      const room = roomManager.get(ws.roomId);
+      if (!room) return;
+
+      // find the bot transport entry by transportId
+      const entry = room.botTransports?.get(data.transportId);
+
+      console.log(`🔄 Bot requests resume for transport ${data.transportId}`);
+
+      if (!entry?.consumer) {
+        ws.send(JSON.stringify({
+          type: 'bot-error',
+          message: 'No consumer found for transport: ' + data.transportId
+        }));
+        return;
+      }
+
+      // this is the moment RTP starts flowing to the bot's UDP socket
+      await entry.consumer.resume();
+
+      console.log(`▶️ Bot consumer resumed for transport ${data.transportId}`);
+
+      // confirm to bot that RTP is now flowing
+      ws.send(JSON.stringify({
+        type: 'bot-consumer-resumed',
+        transportId: data.transportId
+      }));
+    }
+
+    else if (data.type === 'create-bot-producer-transport') {
+      const room = roomManager.get(ws.roomId);
+      if (!room?.router) return;
+
+      // PlainTransport that RECEIVES RTP from the Python bot
+      // comedia:true means mediasoup learns bot's IP:port
+      // from the first RTP packet it receives
+      const transport = await room.router.createPlainTransport({
+        listenIp: { ip: '127.0.0.1' },
+        rtcpMux: true,
+        comedia: true,
+      });
+
+      // Store separately from consumer transports
+      if (!room.botProducerTransports) {
+        room.botProducerTransports = new Map();
+      }
+      room.botProducerTransports.set(transport.id, {
+        transport,
+        peerId: ws.peerId,
+        producer: null
+      });
+
+      // Send back IP:port so Python bot knows where to send UDP
+      ws.send(JSON.stringify({
+        type: 'bot-producer-transport-created',
+        id: transport.id,
+        ip: transport.tuple.localIp,
+        port: transport.tuple.localPort,
+      }));
+    }
+
+    else if (data.type === 'create-bot-producer') {
+      const room = roomManager.get(ws.roomId);
+      if (!room) return;
+
+      const entry = room.botProducerTransports?.get(data.transportId);
+      if (!entry) {
+        ws.send(JSON.stringify({ type: 'bot-error', message: 'Transport not found' }));
+        return;
+      }
+
+      // Create Producer — mediasoup now expects RTP on this transport
+      // rtpParameters tells mediasoup what codec/SSRC to expect
+      const producer = await entry.transport.produce({
+        kind: 'audio',
+        rtpParameters: data.rtpParameters,
+      });
+
+      entry.producer = producer;
+
+      // Store in room.producers so browser peers auto-consume it
+      room.producers.set(producer.id, {
+        producer,
+        peerId: ws.peerId,
+        kind: 'audio',
+      });
+      console.log(
+        'BOT PRODUCER REGISTERED',
+        producer.id,
+        ws.peerId
+      );
+
+      // Notify all browser peers about the new producer
+      // They will create consumers and hear the bot
+      for (const [peerId, peerWs] of room.peers) {
+        if (peerId === ws.peerId) continue;
+        const recvTransport = room.peersData.get(peerId)?.recvTransport;
+        if (!recvTransport) continue;
+        const rtpCapabilities = peerWs.rtpCapabilities;
+        if (!rtpCapabilities) continue;
+        if (!room.router.canConsume({ producerId: producer.id, rtpCapabilities })) continue;
+
+        const consumer = await recvTransport.consume({
+          producerId: producer.id,
+          rtpCapabilities,
+          paused: true,
+          appData: { peerId: ws.peerId, consumingPeerId: peerId }
+        });
+
+        room.consumers.set(consumer.id, consumer);
+
+        peerWs.send(JSON.stringify({
+          type: 'new-consumer',
+          params: {
+            consumerId: consumer.id,
+            producerId: producer.id,
+            kind: consumer.kind,
+            rtpParameters: consumer.rtpParameters,
+            producerPeerId: ws.peerId,
+          }
+        }));
+      }
+
+      ws.send(JSON.stringify({
+        type: 'bot-producer-created',
+        producerId: producer.id,
+      }));
+    }
 
     // 🔥 SCREEN SHARE SIGNALING (ADD THIS)
     else if (data.type === 'screen-share-start' || data.type === 'screen-share-stop') {
@@ -1592,6 +1831,16 @@ else if (data.type === 'stop-recording') {
       pId
     );
 
+    // 🔥 6. CLOSE BOT TRANSPORTS
+    for (const [id, entry] of room.botTransports) {
+      if (entry.peerId === pId) {
+        try { entry.consumer?.close(); } catch(e) {}
+        try { entry.transport.close(); } catch(e) {}
+        room.botTransports.delete(id);
+        console.log(`Closed bot transport ${id} for ${pId}`);
+      }
+    }
+
     console.log(`✅ Cleanup complete for ${pId}`);
 
     // Delete room if empty
@@ -1613,6 +1862,7 @@ else if (data.type === 'stop-recording') {
   
     await roomManager.delete(rId);    // ← await since delete() is now async
   }
+  
   },10000);
 });
 });
@@ -1722,6 +1972,12 @@ async function gracefulShutdown(signal) {
       room.recordingTransport = null;
       room.recordingAudioConsumer = null;
       room.recordingAudioTransport = null;
+
+      for (const [, entry] of room.botTransports) {
+        try { entry.consumer?.close(); } catch(e) {}
+        try { entry.transport.close(); } catch(e) {}
+      }
+      room.botTransports.clear();
     }
 
     // ─────────────────────────────────────────────

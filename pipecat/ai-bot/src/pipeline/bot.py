@@ -8,16 +8,18 @@ from deepgram import (
     LiveOptions,
     LiveTranscriptionEvents,
 )
-import pyaudio
+# import pyaudio
 import os
 from .config import Config
+from .rtp_receiver import RTPReceiver
+from .rtp_sender import RTPSender, make_rtp_parameters
+from .signalling import BotSignalling
+import json
 
 os.environ['PYTHONWARNINGS'] = 'ignore'
 
 CHUNK = 1024
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 16000
+RATE = 16000 
 
 conversation_history = []
 is_speaking = False       # True while TTS is playing
@@ -27,7 +29,7 @@ speech_started = False
 speech_start_time = 0
 
 
-mic_stream = None
+# mic_stream = None
 
 async def ask_claude(user_text: str) -> str:
     try:
@@ -67,12 +69,6 @@ async def speak(text: str, deepgram: DeepgramClient):
     is_speaking = True
     logger.info("🔊 Speaking...")
 
-    subprocess.run(
-    ["amixer", "set", "Capture", "nocap"],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL
-   )
-
     try:
         tts_start = time.time()
         response = await deepgram.asyncspeak.v("1").stream(
@@ -90,23 +86,11 @@ async def speak(text: str, deepgram: DeepgramClient):
         tts_end = time.time()
         logger.info(f"⏱️ TTS Latency: {tts_end - tts_start:.2f}s")
 
-        p = pyaudio.PyAudio()
-        
-        stream = p.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=RATE,
-            output=True
+        # TTS audio ready — speaker output disabled for now
+        # will be sent back to browser via RTP in future
+        logger.info(
+            f"🔊 TTS ready: {len(audio_data)} bytes"
         )
-    
-
-        stream.write(audio_data)
-
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
-
-        logger.info(f"🔊 Spoke: {text}")
 
     except Exception as e:
         logger.error(f"TTS error: {e}")
@@ -114,19 +98,7 @@ async def speak(text: str, deepgram: DeepgramClient):
     finally:
         await asyncio.sleep(1.0)
 
-        subprocess.run(
-            ["amixer", "set", "Capture", "cap"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-
         is_speaking = False
-
-        for _ in range(5):
-            mic_stream.read(
-                CHUNK,
-                exception_on_overflow=False
-            )
 
         pipeline_end = time.time()
 
@@ -154,8 +126,8 @@ async def keep_alive(connection):
     silence = b'\x00' * CHUNK * 2
     while True:
         try:
-            if is_speaking:
-                await connection.send(silence)
+            # if is_speaking:
+            await connection.send(silence)
         except Exception:
             pass
         await asyncio.sleep(0.5)
@@ -173,6 +145,7 @@ async def run_bot():
     connection = deepgram.listen.asynclive.v("1")
 
     async def on_transcript(self, result, **kwargs):
+        # logger.info("🔥 TRANSCRIPT CALLBACK ENTERED")
         global speech_started
         global speech_start_time
         global pipeline_start_time
@@ -194,7 +167,7 @@ async def run_bot():
             speech_start_time = time.time()
 
        # ONLY process FINAL transcript
-        if result.is_final:
+        if sentence:
 
             transcript_received_time = time.time()
 
@@ -248,32 +221,46 @@ async def run_bot():
 
     logger.info("✅ Deepgram connection started")
 
-    await asyncio.sleep(1.0)
-
-    p = pyaudio.PyAudio()
-    stream = p.open(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=RATE,
-        input=True,
-        frames_per_buffer=CHUNK
-    )
-    global mic_stream
-    mic_stream = stream
-
-    logger.info("🎤 Microphone opened — speak now!")
-    logger.info("Press Ctrl+C to stop")
-
-    # Start keep-alive as separate background task
     asyncio.create_task(keep_alive(connection))
 
+    await asyncio.sleep(1.0)
+
+    # Start RTP receiver first so port is ready
+    rtp = RTPReceiver(host='127.0.0.1', port=55000)
+    actual_port = rtp.start()
+    logger.info(f"🎧 RTP receiver ready on port {actual_port}")
+
+    # Connect signalling and set up both paths
+    signalling = BotSignalling(
+        server_url=Config.SIGNALLING_URL,
+        token=Config.BOT_TOKEN,
+        rtp_port=actual_port
+    )
+    await signalling.connect()
+
+    # receive path — bot hears browser mic
+    await signalling.setup(
+        room_id=Config.BOT_ROOM_ID,
+        producer_id=Config.BOT_PRODUCER_ID
+    )
+    await signalling.ready.wait()
+    logger.info("✅ Receive path ready — browser audio flowing")
+
+    # send path — browser hears bot tone
+    await signalling.setup_send_path()
+    logger.info("✅ Send path ready — browser hears bot tone")
+
+    # keep signalling alive in background
+    asyncio.create_task(signalling.listen())
+
+    # Start keep-alive as separate background task
+    # asyncio.create_task(keep_alive(connection))
+
     try:
+        packet_count = 0
         while True:
             if not is_speaking:
-                data = stream.read(
-                    CHUNK,
-                    exception_on_overflow=False
-                )
+                data = await rtp.read_pcm_chunk()
                 await connection.send(data)
             await asyncio.sleep(0.01)
 
@@ -282,7 +269,5 @@ async def run_bot():
 
     finally:
         await connection.finish()
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
-        logger.info("🎤 Microphone closed")
+        rtp.close()
+        logger.info("🎧 RTP receiver closed")
