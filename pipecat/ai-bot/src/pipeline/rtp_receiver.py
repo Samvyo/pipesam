@@ -1,6 +1,8 @@
 import socket
 import opuslib
 import asyncio
+import audioop
+import struct
 from loguru import logger
 
 # RTP header is always 12 bytes
@@ -15,6 +17,10 @@ OUTPUT_CHANNELS = 1        # Deepgram wants mono
 # 20ms frame size at 48khz = 48000 × 0.02 (20 ms) = 960 samples per channel
 OPUS_FRAME_SIZE = 960
 
+PCM_48K_SILENCE_BYTES = OPUS_FRAME_SIZE * OPUS_CHANNELS * 2
+
+PCM_16K_SILENCE_BYTES = (OPUS_FRAME_SIZE // 3) * OUTPUT_CHANNELS * 2
+
 class RTPReceiver:
     def __init__(self, host='127.0.0.1', port=0):
         # port=0 means OS picks a free port automatically
@@ -22,7 +28,8 @@ class RTPReceiver:
         self.port = port
         self.sock = None
         self.decoder = None
-        self._pcm_buffer = bytearray()
+        self._skip_count = 0  # count of packets to skip after corruption detected
+        self._header_logged = False  # log RTP header info only for the first packet
 
     def start(self):
         # Create UDP socket
@@ -36,7 +43,7 @@ class RTPReceiver:
         self.port = self.sock.getsockname()[1]
         
         # Non-blocking so we can use with asyncio
-        self.sock.setblocking(False)
+        self.sock.setblocking(True)
         
         # Create Opus decoder
         # mediasoup sends 48khz stereo Opus
@@ -50,7 +57,6 @@ class RTPReceiver:
 
     # Parses RTP header fields (version, payload type, sequence, timestamp, SSRC, etc.) for debugging and stream validation.
     def parse_rtp_header(self, packet: bytes) -> dict:
-        import struct
         if len(packet) < 12:
             return {}
 
@@ -112,41 +118,26 @@ class RTPReceiver:
                 opus_bytes,
                 OPUS_FRAME_SIZE
             )
-            return pcm
+            return pcm, False  # False = not silence
         except Exception as e:
             logger.warning(f"Opus decode error: {e}")
-            return b''
+            # return b''
+            # ✅ Reset decoder so next packet starts fresh
+            self.decoder = opuslib.Decoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS)
+            
+            # ✅ Return silence instead of empty bytes
+            # 960 samples × 2 channels × 2 bytes = 3840 bytes of silence
+            return bytes(OPUS_FRAME_SIZE * OPUS_CHANNELS * 2), True  # True = silence
 
-    # Convert 48kHz stereo PCM into 16kHz mono PCM required by Deepgram. 
+   
     def _stereo_48k_to_mono_16k(self, pcm_48k_stereo: bytes) -> bytes:
-        import struct
-        
-        # Stereo = 2 samples per frame = 4 bytes per frame
-        samples = struct.unpack(
-            f'<{len(pcm_48k_stereo)//2}h',
-            pcm_48k_stereo
-        )
-        
-        # Step 1: stereo to mono
-        # samples = [L, R, L, R, L, R, ...]
-        # mono = average of L and R
-        mono = []
-        for i in range(0, len(samples), 2):
-            left = samples[i]
-            right = samples[i + 1] if i + 1 < len(samples) else left
-            avg = (left + right) // 2
-            mono.append(avg)
-        
-        # Step 2: downsample 48khz → 16khz
-        # Keep every 3rd sample (48000 / 3 = 16000)
-        downsampled = mono[::3]
-        
-        # Pack back to bytes
-        return struct.pack(f'<{len(downsampled)}h', *downsampled)
+        mono_48k = audioop.tomono(pcm_48k_stereo, 2, 0.5, 0.5)
+        mono_16k, _ = audioop.ratecv(mono_48k, 2, 1, 48000, 16000, None)
+        return mono_16k
 
     # Receive RTP packets, extract Opus audio, decode to PCM, and return Deepgram-ready audio chunks.
     async def read_pcm_chunk(self) -> bytes:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         
         while True:
             try:
@@ -154,7 +145,7 @@ class RTPReceiver:
                     None,
                     lambda: self.sock.recv(4096)
                 )
-                if not hasattr(self, '_header_logged'):
+                if not self._header_logged:
                     self._header_logged = True
                     h = self.parse_rtp_header(packet)
                     logger.info(
@@ -168,23 +159,36 @@ class RTPReceiver:
                     )
                 # Step 1: remove 12-byte RTP header
                 opus_bytes = self._strip_rtp_header(packet)
+    
                 if not opus_bytes:
                     continue
                 
                 # Step 2: decode Opus → PCM 48khz stereo
-                pcm_48k = self._decode_opus_to_pcm(opus_bytes)
-                if not pcm_48k:
-                    continue
-                
-                # Step 3: convert to 16khz mono for Deepgram
+                pcm_48k, is_corrupt = self._decode_opus_to_pcm(opus_bytes)
+
+                if is_corrupt:
+                    self._skip_count = 3  # skip next 3 packets after corruption
+                    silence_16k = bytes(PCM_16K_SILENCE_BYTES)
+                    return silence_16k
+ 
+                if self._skip_count > 0:
+                    self._skip_count -= 1
+                    return bytes(PCM_16K_SILENCE_BYTES)
+ 
+                # Step 3 — downsample 48kHz stereo → 16kHz mono
                 pcm_16k = self._stereo_48k_to_mono_16k(pcm_48k)
-                
+        
                 return pcm_16k
+
+
+            # except BlockingIOError:
+            #         await asyncio.sleep(0.005)
+            except asyncio.CancelledError:
+                raise
                 
-            except BlockingIOError:
-                # No packet available yet, wait a little
-                await asyncio.sleep(0.005)
-                continue
+            except Exception as e:
+                    logger.error(f"RTP recv error: {e}")
+                    await asyncio.sleep(0.005)
 
     # Return the UDP port currently used by the RTP receiver.
     def get_port(self) -> int:

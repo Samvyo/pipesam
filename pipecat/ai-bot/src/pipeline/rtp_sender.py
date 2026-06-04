@@ -22,6 +22,7 @@ class RTPSender:
         self.seq = 0          # sequence number, increases by 1
         self.timestamp = 0    # increases by FRAME_SIZE each packet
         self.ssrc = 12345678  # any fixed number, identifies our stream
+        self._send_buffer = bytearray()
     
     # Create UDP socket and initialize the Opus encoder for RTP audio transmission.
     def start(self):
@@ -38,7 +39,7 @@ class RTPSender:
         logger.info(
             f"📡 RTP sender ready → {self.host}:{self.port}"
         )
-
+    
     # Construct a standard 12-byte RTP header containing version, payload type, sequence, timestamp, and SSRC.
     def _make_rtp_header(self) -> bytes:
         byte0 = 0x80          # V=2, P=0, X=0, CC=0
@@ -54,6 +55,61 @@ class RTPSender:
         )
         return header
 
+    # Encode raw PCM audio into a compressed Opus frame.
+    def _encode_opus(self, pcm_bytes: bytes) -> bytes:
+        return self.encoder.encode(pcm_bytes, FRAME_SIZE)
+
+    # ADD these two methods to RTPSender class
+    def _mono_16k_to_stereo_48k(self, pcm_16k_mono: bytes) -> bytes:
+        # Why this method exists:
+        # Deepgram TTS outputs 16kHz mono PCM
+        # But Opus encoder was initialized with SAMPLE_RATE=48000, CHANNELS=2
+        # So we must upsample before encoding
+        # 16000 × 3 = 48000 (repeat each sample 3 times)
+        # mono → stereo (duplicate sample for left and right)
+        samples = struct.unpack(
+            f'<{len(pcm_16k_mono) // 2}h',
+            pcm_16k_mono
+        )
+        upsampled = []
+        for s in samples:
+            for _ in range(3):       # upsample 16k → 48k
+                upsampled.append(s)  # left channel
+                upsampled.append(s)  # right channel (mono → stereo)
+        return struct.pack(f'<{len(upsampled)}h', *upsampled)
+
+
+    def send_audio(self, pcm_16k_mono: bytes):
+    
+        # Step 1: upsample 16kHz mono → 48kHz stereo
+        # Why: Opus encoder needs 48kHz stereo to match what we told MediaSoup
+        pcm_48k = self._mono_16k_to_stereo_48k(pcm_16k_mono)
+
+        # Step 2: buffer incoming audio
+        
+        self._send_buffer.extend(pcm_48k)
+
+        bytes_per_frame = FRAME_SIZE * CHANNELS * 2  # 960 * 2 * 2 = 3840
+
+        # Step 3: drain buffer in exact 3840-byte chunks
+        while len(self._send_buffer) >= bytes_per_frame:
+            chunk = bytes(self._send_buffer[:bytes_per_frame])
+            del self._send_buffer[:bytes_per_frame]
+
+            # → encode Opus
+            opus_bytes = self._encode_opus(chunk)
+
+            # → RTP header
+            header = self._make_rtp_header()
+
+            # → UDP send to MediaSoup → browser
+            packet = header + opus_bytes
+            self.sock.sendto(packet, (self.host, self.port))
+
+            # advance RTP counters for next packet
+            self.seq       = (self.seq + 1)        & 0xFFFF
+            self.timestamp = (self.timestamp + FRAME_SIZE) & 0xFFFFFFFF 
+
     # Generate a 20ms PCM sine-wave audio frame at the specified frequency.
     def _generate_sine_frame(self, freq: float = 440.0) -> bytes:
         samples = []
@@ -67,9 +123,6 @@ class RTPSender:
 
         return struct.pack(f'<{len(samples)}h', *samples)
 
-    # Encode raw PCM audio into a compressed Opus frame.
-    def _encode_opus(self, pcm_bytes: bytes) -> bytes:
-        return self.encoder.encode(pcm_bytes, FRAME_SIZE)
 
 
     # Create an RTP packet by generating PCM audio, encoding it to Opus, and sending it to MediaSoup over UDP.
@@ -93,29 +146,6 @@ class RTPSender:
         self.seq       = (self.seq + 1) & 0xFFFF
         self.timestamp = (self.timestamp + FRAME_SIZE) & 0xFFFFFFFF
     
-
-    # Continuously stream RTP audio frames at 20ms intervals until stopped or duration expires.
-    async def stream_tone(
-        self,
-        freq: float = 440.0,
-        duration_seconds: float = None
-    ):
-        logger.info(
-            f"🎵 Streaming {freq}Hz tone → "
-            f"{self.host}:{self.port}"
-        )
-        start = time.time()
-        try:
-            while True:
-                self.send_tone_frame(freq)
-                # send one frame every 20ms
-                await asyncio.sleep(0.02)
-
-                if duration_seconds:
-                    if time.time() - start >= duration_seconds:
-                        break
-        except asyncio.CancelledError:
-            logger.info("🛑 Tone streaming stopped")
 
     # Close the RTP UDP socket and release network resources.
     def close(self):

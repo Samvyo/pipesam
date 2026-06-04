@@ -114,9 +114,9 @@ class BotSignalling:
         logger.info(f"🎵 Producer created: {msg['producerId']}")
 
         # Start continuous RTP audio transmission in a background task.
-        asyncio.create_task(
-            self.sender.stream_tone(freq=440.0)
-        )
+        # asyncio.create_task(
+        #     self.sender.stream_tone(freq=440.0)
+        # )
     
     # Continuously listen for signalling messages from the server.
     async def listen(self):

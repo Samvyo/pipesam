@@ -1,5 +1,5 @@
 import asyncio
-import subprocess
+
 import anthropic
 import time
 from loguru import logger
@@ -8,28 +8,58 @@ from deepgram import (
     LiveOptions,
     LiveTranscriptionEvents,
 )
-# import pyaudio
+# import audioop
 import os
 from .config import Config
-from .rtp_receiver import RTPReceiver
-from .rtp_sender import RTPSender, make_rtp_parameters
-from .signalling import BotSignalling
-import json
+from .mediasoup_transport import MediasoupTransport
 
+from pipecat.frames.frames import AudioRawFrame
 os.environ['PYTHONWARNINGS'] = 'ignore'
+import torch
+import numpy as np
+
 
 CHUNK = 1024
 RATE = 16000 
 
-conversation_history = []
+# Silero VAD expects 512 samples at 16kHz
+VAD_CHUNK_SAMPLES = 512
+VAD_CHUNK_BYTES   = VAD_CHUNK_SAMPLES * 2  # int16 = 2 bytes per sample
+
+# speech is confirmed after this many consecutive speech chunks
+SPEECH_CONFIRM_CHUNKS  = 2
+# silence is confirmed after this many consecutive silence chunks
+SILENCE_CONFIRM_CHUNKS = 20  # 20 × 32ms = ~640ms of silence ends utterance
+
+
+conversation_history: list = []
 is_speaking = False       # True while TTS is playing
 pipeline_start_time = 0
 
-speech_started = False
-speech_start_time = 0
+def load_silero_vad():
+    # Load Silero VAD model from torch hub
+    # returns (model, get_speech_timestamps utility)
+    model, utils = torch.hub.load(
+        repo_or_dir='snakers4/silero-vad',
+        model='silero_vad',
+        force_reload=False,
+        trust_repo=True
+    )
+    logger.info("✅ Silero VAD model loaded")
+    return model
 
 
-# mic_stream = None
+def vad_is_speech(model, pcm_bytes: bytes) -> bool:
+    # Convert raw 16kHz mono int16 PCM bytes → float32 tensor for Silero
+    # Silero expects float32 in range [-1.0, 1.0]
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    samples = samples / 32768.0
+    tensor  = torch.from_numpy(samples)
+
+    # Silero returns confidence 0.0→1.0 that this chunk contains speech
+    confidence = model(tensor, RATE).item()
+    return confidence > 0.5   # threshold — tune if needed
+
 
 async def ask_claude(user_text: str) -> str:
     try:
@@ -64,7 +94,7 @@ async def ask_claude(user_text: str) -> str:
         return "Sorry, I had an error."
 
 
-async def speak(text: str, deepgram: DeepgramClient):
+async def speak(text: str, deepgram: DeepgramClient, transport: MediasoupTransport):
     global is_speaking, pipeline_start_time  # should_interrupt, pipeline_start_time
     is_speaking = True
     logger.info("🔊 Speaking...")
@@ -91,6 +121,12 @@ async def speak(text: str, deepgram: DeepgramClient):
         logger.info(
             f"🔊 TTS ready: {len(audio_data)} bytes"
         )
+        frame = AudioRawFrame(
+            audio=audio_data,
+            sample_rate=RATE,
+            num_channels=1
+        )
+        await transport.output().process_frame(frame, direction=None)
 
     except Exception as e:
         logger.error(f"TTS error: {e}")
@@ -130,7 +166,7 @@ async def keep_alive(connection):
             await connection.send(silence)
         except Exception:
             pass
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(5)
 
 
 async def run_bot():
@@ -139,59 +175,41 @@ async def run_bot():
     Config.validate()
     logger.info("🚀 Starting pipeline...")
 
+    # Load Silero VAD model once at startup
+    vad_model = load_silero_vad()
+
     deepgram = DeepgramClient(Config.DEEPGRAM_API_KEY)
     logger.info("✅ Connected to Deepgram")
 
     connection = deepgram.listen.asynclive.v("1")
 
+    transport = MediasoupTransport()
+    await transport.start()
+    logger.info("✅ MediaSoup transport started")
+
+   
     async def on_transcript(self, result, **kwargs):
-        # logger.info("🔥 TRANSCRIPT CALLBACK ENTERED")
-        global speech_started
-        global speech_start_time
         global pipeline_start_time
 
-        sentence = (
-            result.channel.alternatives[0].transcript
-        )
-
-        if not sentence:
+        if not result.is_final:
             return
 
-        # Ignore bot voice during TTS
+        sentence = result.channel.alternatives[0].transcript.strip()
+        if not sentence:
+            return
         if is_speaking:
             return
 
-        # FIRST interim transcript received
-        if not speech_started:
-            speech_started = True
-            speech_start_time = time.time()
+        logger.info(f"📝 You said: {sentence}")
+        pipeline_start_time = time.time()
 
-       # ONLY process FINAL transcript
-        if sentence:
+        logger.info("🧠 Calling Claude")
 
-            transcript_received_time = time.time()
+        reply = await ask_claude(sentence)
 
-            stt_latency = (
-                transcript_received_time
-                - speech_start_time
-            )
+        logger.info("🧠 Claude completed")
 
-            logger.info(f"📝 You said: {sentence}")
-
-            logger.info(
-                f"⏱️ STT Duration: "
-                f"{stt_latency:.2f}s"
-            )
-
-            # Reset for next user speech
-            speech_started = False
-            speech_start_time = 0
-
-            pipeline_start_time = time.time()
-
-            reply = await ask_claude(sentence)
-
-            await speak(reply, deepgram)
+        await speak(reply, deepgram, transport)
 
         
     async def on_error(self, error, **kwargs):
@@ -210,7 +228,7 @@ async def run_bot():
         sample_rate=RATE,
         # utterance_end_ms=2000,
         # vad_events=True, 
-        endpointing= 2500,
+        endpointing= 1000,
     )
 
     success = await connection.start(options)
@@ -223,51 +241,106 @@ async def run_bot():
 
     asyncio.create_task(keep_alive(connection))
 
-    await asyncio.sleep(1.0)
+    async def forward_audio():
+        # logger.info("🚀 forward_audio started")
+        # VAD state machine
+        vad_buffer          = bytearray()  # accumulates incoming PCM
+        speech_buffer       = bytearray()  # accumulates speech audio to send
+        speech_chunk_count  = 0            # consecutive speech chunks seen
+        silence_chunk_count = 0            # consecutive silence chunks seen
+        in_speech           = False        # currently inside an utterance
 
-    # Start RTP receiver first so port is ready
-    rtp = RTPReceiver(host='127.0.0.1', port=55000)
-    actual_port = rtp.start()
-    logger.info(f"🎧 RTP receiver ready on port {actual_port}")
+        while True:
+            try:
+                frame = await transport.input().audio_queue.get()
 
-    # Connect signalling and set up both paths
-    signalling = BotSignalling(
-        server_url=Config.SIGNALLING_URL,
-        token=Config.BOT_TOKEN,
-        rtp_port=actual_port
-    )
-    await signalling.connect()
+                pcm = frame.audio
+                # logger.info(f"PCM received: {len(pcm)} bytes")
+                if not pcm:
+                    continue
+                if is_speaking:
+                    continue
+                
+                # accumulate into vad_buffer
+                vad_buffer.extend(pcm)
 
-    # receive path — bot hears browser mic
-    await signalling.setup(
-        room_id=Config.BOT_ROOM_ID,
-        producer_id=Config.BOT_PRODUCER_ID
-    )
-    await signalling.ready.wait()
-    logger.info("✅ Receive path ready — browser audio flowing")
+                # process in VAD_CHUNK_BYTES sized chunks (512 samples = 32ms)
+                while len(vad_buffer) >= VAD_CHUNK_BYTES:
+                    chunk = bytes(vad_buffer[:VAD_CHUNK_BYTES])
+                    del vad_buffer[:VAD_CHUNK_BYTES]
 
-    # send path — browser hears bot tone
-    await signalling.setup_send_path()
-    logger.info("✅ Send path ready — browser hears bot tone")
+                    # run Silero VAD on this 32ms chunk
+                    # run in executor so it doesn't block the event loop
+                    loop = asyncio.get_running_loop()
 
-    # keep signalling alive in background
-    asyncio.create_task(signalling.listen())
+                    is_speech = await loop.run_in_executor(
+                        None,
+                        vad_is_speech,
+                        vad_model,
+                        chunk
+                    )
+                   
 
-    # Start keep-alive as separate background task
-    # asyncio.create_task(keep_alive(connection))
+                    if is_speech:
+                        silence_chunk_count  = 0
+                        speech_chunk_count  += 1
+
+                        # always buffer speech audio
+                        speech_buffer.extend(chunk)
+
+                        # confirm speech onset after SPEECH_CONFIRM_CHUNKS
+                        if not in_speech and speech_chunk_count >= SPEECH_CONFIRM_CHUNKS:
+                            in_speech = True
+                            logger.info("🎤 VAD: speech started")
+
+                        if in_speech:
+                            await connection.send(chunk)
+
+                    else:
+                        speech_chunk_count   = 0
+                        silence_chunk_count += 1
+
+                        if in_speech:
+                            # still buffer during short silences (part of speech)
+                            speech_buffer.extend(chunk)
+
+                            # end utterance after SILENCE_CONFIRM_CHUNKS of silence
+                            if silence_chunk_count >= SILENCE_CONFIRM_CHUNKS:
+                                in_speech           = False
+                                silence_chunk_count = 0
+                                logger.info(
+                                    f"🔇 VAD: speech ended — "
+                                    f"sending {len(speech_buffer)} bytes to Deepgram"
+                                )
+ 
+                                try:
+                                    await connection.finalize()
+                                    logger.info("✅ Deepgram finalize sent")
+                                except Exception as e:
+                                    logger.error(f"Finalize error: {e}")
+
+                                speech_buffer.clear()
+                                            
+                                
+                        else:
+                            # silence outside speech — discard, don't send to Deepgram
+                            pass
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Audio forward error: {e}")
+
+    forward_task = asyncio.create_task(forward_audio())
+
+    # logger.info("🚀 forward_audio task created")
 
     try:
-        packet_count = 0
-        while True:
-            if not is_speaking:
-                data = await rtp.read_pcm_chunk()
-                await connection.send(data)
-            await asyncio.sleep(0.01)
-
+        await asyncio.Event().wait()
     except KeyboardInterrupt:
         logger.info("👋 Stopped by user")
-
     finally:
+        forward_task.cancel()
         await connection.finish()
-        rtp.close()
-        logger.info("🎧 RTP receiver closed")
+        await transport.stop()
+        logger.info("✅ Bot shut down cleanly")
