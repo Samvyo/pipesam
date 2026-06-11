@@ -30,6 +30,8 @@ function App() {
   const [users, setUsers] = useState([]);
   const [peerState, setPeerState] = useState({});
 
+  const [captions, setCaptions] = useState({});
+
   const [token, setToken] = useState("");
   const [joined, setJoined] = useState(false);
   const [myPeerId, setMyPeerId] = useState("");
@@ -104,6 +106,22 @@ function App() {
     room.onLocalScreenStream = (stream) => setLocalScreenStream(stream || null);
     room.onMessage = () => {};
     room.onChat = (msg) => setChat(prev => [...prev, msg]);
+
+
+    room.onTranscript = (data) => {
+
+      console.log(
+        "APP TRANSCRIPT",
+        data.speaker,
+        data.text
+      );
+
+      setCaptions(prev => ({
+        ...prev,
+        [data.speaker]: data.text
+      }));
+
+    };
 
     room.onPeersUpdate = (list) => {
       setUsers(list);
@@ -453,6 +471,27 @@ function App() {
             border:"none", borderRadius:"50%", width:22, height:22, cursor:"pointer",
             color:"#fff", fontSize:11, lineHeight:"22px", textAlign:"center"
           }}>ℹ</button>
+          
+          {captions[myPeerId] && (
+            <div
+              style={{
+                position: "absolute",
+                bottom: 28,
+                left: 4,
+                right: 4,
+                background: "rgba(0,0,0,0.75)",
+                color: "#fff",
+                padding: "6px",
+                borderRadius: "6px",
+                fontSize: "12px",
+                textAlign: "center",
+                zIndex: 10
+              }}
+            >
+              {captions[myPeerId]}
+            </div>
+          )}
+
           <span style={{ position:"absolute", bottom:4, left:4, color:"#e8e8ec", fontSize:10, background:"rgba(0,0,0,0.7)", padding:"2px 6px", borderRadius:4 }}>
             {myPeerId||"You"} {myState.muted?"🔇":"🔊"} {myState.videoOff?"📷❌":"📷"}
           </span>
@@ -480,6 +519,26 @@ function App() {
               border:"none", borderRadius:"50%", width:22, height:22, cursor:"pointer",
               color:"#fff", fontSize:11, lineHeight:"22px", textAlign:"center"
             }}>ℹ</button>
+
+            {captions[pid] && (
+              <div
+                style={{
+                  position: "absolute",
+                  bottom: 28,
+                  left: 4,
+                  right: 4,
+                  background: "rgba(0,0,0,0.75)",
+                  color: "#fff",
+                  padding: "6px",
+                  borderRadius: "6px",
+                  fontSize: "12px",
+                  textAlign: "center",
+                  zIndex: 10
+                }}
+              >
+                {captions[pid]}
+              </div>
+            )}
             <span style={{ position:"absolute", bottom:4, left:4, color:"#e8e8ec", fontSize:10, background:"rgba(0,0,0,0.7)", padding:"2px 6px", borderRadius:4 }}>
               {pid} <span id={`label-mute-${pid}`}>🔊</span><span id={`label-screen-${pid}`}/>
             </span>

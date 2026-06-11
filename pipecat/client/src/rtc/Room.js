@@ -46,6 +46,8 @@ export default class Room {
     this.dataConsumers = new Map();
     this.isRateLimited = false;
     this._serverShutdown = false;
+
+    this.onTranscript = null;
   }
 
   setStatus(val) {
@@ -465,6 +467,17 @@ export default class Room {
         this.addChatMsg(`${data.from}: ${data.text}`);
       }
 
+      if (data.type === 'transcript') {
+
+        console.log(
+          'LIVE TRANSCRIPT',
+          data.speaker,
+          data.text
+        );
+
+        this.onTranscript?.(data);
+
+      }
       // ✅ Server created transport — set up client side
      if (data.type === 'transport-created') {
       if (!this.device) {

@@ -998,7 +998,7 @@ if (data.type === 'rtp-capabilities') {
       } else {
         logger.info({ peerId, event: 'session-recovered' });
       }
-    }
+  }
     
     else if (data.type === 'create-transport') {
       const room = roomManager.get(ws.roomId); 
@@ -1013,7 +1013,7 @@ if (data.type === 'rtp-capabilities') {
       const transport = await room.router.createWebRtcTransport({
         listenIps: [{ 
           ip: "0.0.0.0",
-          announcedIp: process.env.ANNOUNCED_IP || "192.168.29.230",// ← change to your laptop IP for phone testing
+          announcedIp: process.env.ANNOUNCED_IP || "10.161.40.137",// ← change to your laptop IP for phone testing
         }],
         enableUdp: true,   // faster, preferred
         enableTcp: true,   // fallback if UDP blocked
@@ -1133,7 +1133,30 @@ if (data.type === 'rtp-capabilities') {
         producer,
         peerId: ws.peerId,   // who owns this producer
         kind: producer.kind,
+
       });
+
+      if (producer.kind === 'audio') {
+
+        const botSocket = room.peers.get('bot');
+
+        if (
+          botSocket &&
+          botSocket.readyState === WebSocket.OPEN
+        ) {
+
+          botSocket.send(JSON.stringify({
+            type: 'new-audio-producer',
+            producerId: producer.id,
+            peerId: ws.peerId
+          }));
+
+          console.log(
+            `📢 Sent producer ${producer.id} (${ws.peerId}) to bot`
+          );
+
+        }
+      }
 
       await store.addProducer(ws.roomId, producer.id, ws.peerId, producer.kind);
 
@@ -1335,6 +1358,34 @@ if (data.type === 'rtp-capabilities') {
         }
       }));
     }
+
+    else if (data.type === 'transcript') {
+
+      const room = roomManager.get(ws.roomId);
+
+      if (!room) return;
+
+      console.log(
+        `📝 Transcript: ${data.speaker}: ${data.text}`
+      );
+
+      room.peers.forEach((client) => {
+
+        if (client.readyState === WebSocket.OPEN) {
+
+          client.send(JSON.stringify({
+            type: 'transcript',
+            speaker: data.speaker,
+            text: data.text,
+            confidence: data.confidence,
+            ts: data.ts
+          }));
+
+        }
+
+      });
+
+    }
   
     else if (data.type === 'chat') {
       const room = roomManager.get(ws.roomId);
@@ -1413,7 +1464,7 @@ if (data.type === 'rtp-capabilities') {
       room.botTransports.set(transport.id, {
         transport,
         peerId: ws.peerId,
-        consumer: null
+        consumers: new Map() // bot may create multiple consumers on this transport
       });
 
       // Step 4: send the server's IP and port back to the bot
@@ -1473,6 +1524,8 @@ if (data.type === 'rtp-capabilities') {
         return;
       }
 
+      const producerPeerId = producerEntry.peerId;
+
       // Create the consumer — this starts copying RTP to the bot
       const consumer = await entry.transport.consume({
         producerId: data.producerId,
@@ -1482,19 +1535,23 @@ if (data.type === 'rtp-capabilities') {
 
       console.log(
         'BOT CONSUMER CREATED',
-        consumer.id,
-        consumer.kind,
-        consumer.producerId
+        {
+          peerId: producerPeerId,
+          consumerId: consumer.id,
+          kind: consumer.kind,
+          producerId: consumer.producerId
+        }
       );
 
       // Save the consumer for cleanup
-      entry.consumer = consumer;
+      entry.consumers.set(consumer.id, consumer);
 
       // Send back everything the bot needs to decode the packets
       ws.send(JSON.stringify({
         type: 'bot-consumer-created',
         consumerId: consumer.id,
         kind: consumer.kind,
+        peerId: producerPeerId,
         rtpParameters: consumer.rtpParameters,
       }));
     }
@@ -1509,7 +1566,10 @@ if (data.type === 'rtp-capabilities') {
 
       console.log(`🔄 Bot requests resume for transport ${data.transportId}`);
 
-      if (!entry?.consumer) {
+      if (
+        !entry?.consumers ||
+        entry.consumers.size === 0
+      ) {
         ws.send(JSON.stringify({
           type: 'bot-error',
           message: 'No consumer found for transport: ' + data.transportId
@@ -1518,7 +1578,11 @@ if (data.type === 'rtp-capabilities') {
       }
 
       // this is the moment RTP starts flowing to the bot's UDP socket
-      await entry.consumer.resume();
+      for (const consumer of entry.consumers.values()) {
+
+        await consumer.resume();
+
+      }
 
       console.log(`▶️ Bot consumer resumed for transport ${data.transportId}`);
 
@@ -1627,6 +1691,22 @@ if (data.type === 'rtp-capabilities') {
         type: 'bot-producer-created',
         producerId: producer.id,
       }));
+
+      console.log(`🔍 All producers in room:`, [...room.producers.entries()].map(([id, e]) => `${e.peerId}/${e.kind}`));
+
+      // ✅ Bot is fully ready now — tell it about all existing audio producers
+      for (const [producerId, { peerId: producerPeerId, kind }] of room.producers) {
+        if (kind !== 'audio') continue;
+        if (producerPeerId === 'bot') continue;  // skip bot's own producer
+
+        ws.send(JSON.stringify({
+          type: 'new-audio-producer',
+          producerId: producerId,
+          peerId: producerPeerId,
+        }));
+
+        console.log(`📢 Told bot about ${producerPeerId} → ${producerId}`);
+      }
     }
 
     // 🔥 SCREEN SHARE SIGNALING (ADD THIS)
@@ -1834,7 +1914,21 @@ else if (data.type === 'stop-recording') {
     // 🔥 6. CLOSE BOT TRANSPORTS
     for (const [id, entry] of room.botTransports) {
       if (entry.peerId === pId) {
-        try { entry.consumer?.close(); } catch(e) {}
+        
+        // Close all consumers created on this transport
+        if (entry.consumers) {
+
+          for (const consumer of entry.consumers.values()) {
+
+            try {
+              consumer.close();
+            } catch (e) { }
+
+          }
+
+          entry.consumers.clear();
+        }
+
         try { entry.transport.close(); } catch(e) {}
         room.botTransports.delete(id);
         console.log(`Closed bot transport ${id} for ${pId}`);
@@ -1974,7 +2068,18 @@ async function gracefulShutdown(signal) {
       room.recordingAudioTransport = null;
 
       for (const [, entry] of room.botTransports) {
-        try { entry.consumer?.close(); } catch(e) {}
+        if (entry.consumers) {
+
+          for (const consumer of entry.consumers.values()) {
+
+            try {
+              consumer.close();
+            } catch (e) { }
+
+          }
+
+          entry.consumers.clear();
+        }
         try { entry.transport.close(); } catch(e) {}
       }
       room.botTransports.clear();

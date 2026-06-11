@@ -85,40 +85,42 @@ class MediasoupTransport(BaseTransport):
         return self._output_processor
 
     async def start(self):
-        # Create and bind RTP receiver
+        # Step 1 — bind RTP receiver
         self._receiver = RTPReceiver(host="127.0.0.1", port=55000)
         actual_port = self._receiver.start()
         logger.info(f"🎧 RTP receiver bound on port {actual_port}")
 
-        # Connect signalling
+        # Step 2 — connect signalling
         self._signalling = BotSignalling(
             server_url=Config.SIGNALLING_URL,
             token=Config.BOT_TOKEN,
             rtp_port=actual_port
         )
+
+        self._receiver._signalling = self._signalling 
+        
         await self._signalling.connect()
 
-        # Receive path: browser → bot
-        await self._signalling.setup(
-            room_id=Config.BOT_ROOM_ID,
-            producer_id=Config.BOT_PRODUCER_ID
-        )
-        await self._signalling.ready.wait()
-        logger.info("✅ Receive path ready — browser audio flowing into bot")
+        # Step 3 — start listen() FIRST so _wait_for futures work
+        asyncio.create_task(self._signalling.listen())
 
-        # Send path: bot → browser
+        # Step 4 — setup receive path (join room, create transport)
+        await self._signalling.setup(room_id=Config.BOT_ROOM_ID)
+
+        # Step 5 — setup send path (bot → browser)
         await self._signalling.setup_send_path()
         self._sender = self._signalling.sender
-        logger.info("✅ Send path ready — bot audio will flow to browser")
+        logger.info("✅ Send path ready")
 
-        # Create FrameProcessors now that receiver/sender exist
+        # Step 6 — create frame processors
         self._input_processor = MediasoupInputTransport(self._receiver)
         self._output_processor = MediasoupOutputTransport(self._sender)
 
-        # Start the RTP receive loop
+        # Step 7 — start RTP read loop
         await self._input_processor.start()
 
         logger.info("✅ MediasoupTransport fully started")
+        # No ready.wait() — consumers created dynamically as producers arrive
 
     async def stop(self):
         if self._input_processor:

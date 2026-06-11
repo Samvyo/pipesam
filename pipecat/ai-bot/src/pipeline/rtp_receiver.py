@@ -27,9 +27,10 @@ class RTPReceiver:
         self.host = host
         self.port = port
         self.sock = None
-        self.decoder = None
-        self._skip_count = 0  # count of packets to skip after corruption detected
+        self.decoders = {}
+        self._skip_count = {}  # count of packets to skip after corruption detected
         self._header_logged = False  # log RTP header info only for the first packet
+        self._signalling = None 
 
     def start(self):
         # Create UDP socket
@@ -47,10 +48,8 @@ class RTPReceiver:
         
         # Create Opus decoder
         # mediasoup sends 48khz stereo Opus
-        self.decoder = opuslib.Decoder(
-            OPUS_SAMPLE_RATE,
-            OPUS_CHANNELS
-        )
+        # if ssrc in self.decoders:
+        #     del self.decoders[ssrc]
         
         logger.info(f"🎧 RTP UDP socket bound on port {self.port}")
         return self.port  # caller needs this port number
@@ -61,14 +60,20 @@ class RTPReceiver:
             return {}
 
         byte0 = packet[0]
+        byte1 = packet[1]
+       
+
+        if byte1 in {200, 201, 202, 203, 204, 205, 206}:
+            return {}
+        payload_type = byte1 & 0x7F
         version = (byte0 >> 6) & 0x03
         padding = (byte0 >> 5) & 0x01
         extension = (byte0 >> 4) & 0x01
         cc = (byte0 >> 0) & 0x0F
 
-        byte1 = packet[1]
+        # byte1 = packet[1]
         marker = (byte1 >> 7) & 0x01
-        payload_type = (byte1 >> 0) & 0x7F
+        # payload_type = (byte1 >> 0) & 0x7F
 
         seq = struct.unpack_from('!H', packet, 2)[0] 
         timestamp = struct.unpack_from('!I', packet, 4)[0]
@@ -85,7 +90,41 @@ class RTPReceiver:
             'timestamp': timestamp,
             'ssrc': ssrc,
         }
+    
+    def _get_audio_level(self, packet: bytes, header: dict) -> int:
+        if not header.get('extension'):
+            return -1
 
+        cc = header['cc']
+        ext_offset = 12 + (cc * 4)
+
+        if len(packet) < ext_offset + 4:
+            return -1
+
+        # one-byte header extension profile = 0xBEDE
+        profile = struct.unpack_from('!H', packet, ext_offset)[0]
+        if profile != 0xBEDE:
+            return -1
+
+        ext_len = struct.unpack_from('!H', packet, ext_offset + 2)[0]
+        pos = ext_offset + 4
+        end = pos + (ext_len * 4)
+
+        while pos < end and pos < len(packet):
+            byte = packet[pos]
+            if byte == 0:       # padding byte
+                pos += 1
+                continue
+            ext_id = (byte >> 4) & 0x0F
+            ext_size = (byte & 0x0F) + 1
+            pos += 1
+            if ext_id == 6 and pos < len(packet):   # id=6 is ssrc-audio-level
+                level = packet[pos] & 0x7F           # mask off V bit
+                return level                         # 0=loud, 127=silence
+            pos += ext_size
+
+        return -1
+    
     # Calculates actual RTP header size and removes it, returning only the Opus audio payload.
     def _strip_rtp_header(self, packet: bytes) -> bytes:
         if len(packet) <= RTP_HEADER_SIZE:
@@ -106,15 +145,33 @@ class RTPReceiver:
 
         if len(packet) <= header_size:
             return b''
+        
+        # logger.info(
+        #     f"📦 RTP packet={len(packet)} "
+        #     f"header={header_size} "
+        #     f"payload={len(packet[header_size:])}"
+        # )
 
         return packet[header_size:]
 
     # Decode compressed Opus payload into raw 48kHz stereo PCM audio.
-    def _decode_opus_to_pcm(self, opus_bytes: bytes) -> bytes:
+    def _decode_opus_to_pcm(self, ssrc: int, opus_bytes: bytes):
         try:
+
+            if ssrc not in self.decoders:
+
+                logger.info(
+                    f"🎧 Creating decoder for SSRC {ssrc}"
+                )
+
+                self.decoders[ssrc] = opuslib.Decoder(
+                    OPUS_SAMPLE_RATE,
+                    OPUS_CHANNELS
+                )
+
             # decode() returns raw PCM as bytes
             # OPUS_FRAME_SIZE = samples per channel per frame
-            pcm = self.decoder.decode(
+            pcm = self.decoders[ssrc].decode(
                 opus_bytes,
                 OPUS_FRAME_SIZE
             )
@@ -123,7 +180,7 @@ class RTPReceiver:
             logger.warning(f"Opus decode error: {e}")
             # return b''
             # ✅ Reset decoder so next packet starts fresh
-            self.decoder = opuslib.Decoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS)
+            self.decoders[ssrc] = opuslib.Decoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS)
             
             # ✅ Return silence instead of empty bytes
             # 960 samples × 2 channels × 2 bytes = 3840 bytes of silence
@@ -145,9 +202,26 @@ class RTPReceiver:
                     None,
                     lambda: self.sock.recv(4096)
                 )
+
+                header = self.parse_rtp_header(packet)
+
+                if not header:
+                    continue
+
+                ssrc = header["ssrc"]
+
+                if self._signalling and ssrc in self._signalling.ssrc_to_peer:
+                    self._signalling.current_speaker = self._signalling.ssrc_to_peer[ssrc]
+
+                # Audio level 127 = fully muted. Threshold 40 filters out
+                # anything that is not real speech before it reaches the decoder.
+                audio_level = self._get_audio_level(packet, header)
+                if audio_level != -1 and audio_level > 40:
+                    continue
+                
                 if not self._header_logged:
                     self._header_logged = True
-                    h = self.parse_rtp_header(packet)
+                    h = header
                     logger.info(
                         f"🔬 RTP Header decoded:\n"
                         f"   version={h['version']} (always 2 for RTP)\n"
@@ -164,15 +238,15 @@ class RTPReceiver:
                     continue
                 
                 # Step 2: decode Opus → PCM 48khz stereo
-                pcm_48k, is_corrupt = self._decode_opus_to_pcm(opus_bytes)
+                pcm_48k, is_corrupt = self._decode_opus_to_pcm(ssrc, opus_bytes)
 
                 if is_corrupt:
-                    self._skip_count = 3  # skip next 3 packets after corruption
+                    self._skip_count[ssrc] = 3 # skip next 3 packets after corruption
                     silence_16k = bytes(PCM_16K_SILENCE_BYTES)
                     return silence_16k
  
-                if self._skip_count > 0:
-                    self._skip_count -= 1
+                if self._skip_count.get(ssrc, 0) > 0:
+                    self._skip_count[ssrc] -= 1
                     return bytes(PCM_16K_SILENCE_BYTES)
  
                 # Step 3 — downsample 48kHz stereo → 16kHz mono

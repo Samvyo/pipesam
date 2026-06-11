@@ -3,14 +3,16 @@ import asyncio
 import anthropic
 import time
 from loguru import logger
-from deepgram import (
-    DeepgramClient,
-    LiveOptions,
-    LiveTranscriptionEvents,
-)
+# from deepgram import (
+#     DeepgramClient,
+#     LiveOptions,
+#     LiveTranscriptionEvents,
+# )
 # import audioop
 import os
 from .config import Config
+from .deepgram_stt import DeepgramSTT
+from .whisper_stt import WhisperSTT
 from .mediasoup_transport import MediasoupTransport
 
 from pipecat.frames.frames import AudioRawFrame
@@ -18,6 +20,7 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 import torch
 import numpy as np
 
+from .whisper_stt import WhisperSTT
 
 CHUNK = 1024
 RATE = 16000 
@@ -33,6 +36,7 @@ SILENCE_CONFIRM_CHUNKS = 20  # 20 × 32ms = ~640ms of silence ends utterance
 
 
 conversation_history: list = []
+transcript_log: list = []
 is_speaking = False       # True while TTS is playing
 pipeline_start_time = 0
 
@@ -94,7 +98,7 @@ async def ask_claude(user_text: str) -> str:
         return "Sorry, I had an error."
 
 
-async def speak(text: str, deepgram: DeepgramClient, transport: MediasoupTransport):
+async def speak(text: str, deepgram, transport: MediasoupTransport):
     global is_speaking, pipeline_start_time  # should_interrupt, pipeline_start_time
     is_speaking = True
     logger.info("🔊 Speaking...")
@@ -178,68 +182,190 @@ async def run_bot():
     # Load Silero VAD model once at startup
     vad_model = load_silero_vad()
 
-    deepgram = DeepgramClient(Config.DEEPGRAM_API_KEY)
-    logger.info("✅ Connected to Deepgram")
+    # deepgram = DeepgramClient(Config.DEEPGRAM_API_KEY)
+    # logger.info("✅ Connected to Deepgram")
 
-    connection = deepgram.listen.asynclive.v("1")
+    # connection = deepgram.listen.asynclive.v("1")
+
+    
+    if Config.STT_BACKEND == "whisper":
+        logger.info("🎙️ Using Whisper")
+        stt = WhisperSTT()
+
+    else:
+        logger.info("🎙️ Using Deepgram")
+        stt = DeepgramSTT()
 
     transport = MediasoupTransport()
     await transport.start()
     logger.info("✅ MediaSoup transport started")
 
    
-    async def on_transcript(self, result, **kwargs):
+    # async def on_transcript(self, result, **kwargs):
+    #     global pipeline_start_time
+
+    #     # logger.info(
+    #     #     f"🔥 RAW TRANSCRIPT EVENT: {result}"
+    #     # )
+
+
+    #     if not result.is_final:
+    #         return
+
+    #     alt = result.channel.alternatives[0]
+
+    #     sentence = alt.transcript.strip()
+    #     confidence = alt.confidence
+
+    #     logger.info(
+    #         f"🔍 Deepgram Result | "
+    #         f"is_final={result.is_final} | "
+    #         f"text='{sentence}' | "
+    #         f"confidence={confidence:.2f}"
+    #     )
+
+
+    #     if not sentence:
+    #         return
+
+    #     logger.info(
+    #         f"📝 Transcript: {sentence}"
+    #     )
+
+    #     logger.info(
+    #         f"🎯 Confidence: {confidence:.2f}"
+    #     )
+
+    #     # confidence filtering
+    #     if confidence < 0.70:
+    #         logger.warning(
+    #             f"❌ Transcript rejected "
+    #             f"(confidence={confidence:.2f})"
+    #         )
+    #         return
+
+    #     if is_speaking:
+    #         return
+
+    #     logger.info(
+    #         f"✅ Transcript accepted: {sentence}"
+    #     )
+
+    #     transcript_event = {
+    #         "speaker": transport._signalling.current_speaker,
+    #         "text": sentence,
+    #         "confidence": confidence,
+    #         "ts": time.time()
+    #     }
+
+    #     transcript_log.append(transcript_event)
+
+    #     await transport._signalling.send_transcript(
+    #         speaker=transcript_event["speaker"],
+    #         text=transcript_event["text"],
+    #         confidence=transcript_event["confidence"],
+    #         ts=transcript_event["ts"]
+    #     )
+
+    #     logger.info(
+    #         f"📄 Transcript Event: "
+    #         f"{transcript_event}"
+    #     )
+
+    #     logger.info(
+    #         f"📚 Transcript Log Count: "
+    #         f"{len(transcript_log)}"
+    #     )
+
+    #     pipeline_start_time = time.time()
+
+    #     logger.info("🧠 Calling Claude")
+
+    #     reply = await ask_claude(sentence)
+
+    #     logger.info("🧠 Claude completed")
+
+        # await speak(reply, deepgram, transport)
+    
+    async def on_transcript(text, confidence=1.0):
         global pipeline_start_time
 
-        if not result.is_final:
+        if not text:
             return
 
-        sentence = result.channel.alternatives[0].transcript.strip()
-        if not sentence:
+        if confidence < 0.70:
+            logger.warning(
+                f"❌ Transcript rejected "
+                f"(confidence={confidence:.2f})"
+            )
             return
+
         if is_speaking:
             return
 
-        logger.info(f"📝 You said: {sentence}")
+        logger.info(
+            f"✅ Transcript accepted: {text}"
+        )
+
+        transcript_event = {
+            "speaker": transport._signalling.current_speaker,
+            "text": text,
+            "confidence": confidence,
+            "ts": time.time()
+        }
+
+        transcript_log.append(transcript_event)
+
+        await transport._signalling.send_transcript(
+            speaker=transcript_event["speaker"],
+            text=transcript_event["text"],
+            confidence=transcript_event["confidence"],
+            ts=transcript_event["ts"]
+        )
+
         pipeline_start_time = time.time()
 
         logger.info("🧠 Calling Claude")
 
-        reply = await ask_claude(sentence)
+        reply = await ask_claude(text)
 
         logger.info("🧠 Claude completed")
 
-        await speak(reply, deepgram, transport)
+    stt.on_transcript(on_transcript)
 
+    await stt.start()
+
+
+    # await speak(reply, deepgram, transport)
         
-    async def on_error(self, error, **kwargs):
-        logger.error(f"Deepgram error: {error}")
+    # async def on_error(self, error, **kwargs):
+    #     logger.error(f"Deepgram error: {error}")
 
-    connection.on(LiveTranscriptionEvents.Transcript, on_transcript)
-    connection.on(LiveTranscriptionEvents.Error, on_error)
+    # connection.on(LiveTranscriptionEvents.Transcript, on_transcript)
+    # connection.on(LiveTranscriptionEvents.Error, on_error)
 
-    options = LiveOptions(
-        model=Config.STT_MODEL,
-        language=Config.STT_LANGUAGE,
-        smart_format=True,
-        interim_results= True,
-        encoding="linear16",
-        channels=1,
-        sample_rate=RATE,
-        # utterance_end_ms=2000,
-        # vad_events=True, 
-        endpointing= 1000,
-    )
+    # options = LiveOptions(
+    #     model=Config.STT_MODEL,
+    #     language=Config.STT_LANGUAGE,
+    #     smart_format=True,
+    #     interim_results= True,
+    #     encoding="linear16",
+    #     channels=1,
+    #     sample_rate=RATE,
+    #     # utterance_end_ms=2000,
+    #     # vad_events=True, 
+    #     endpointing= 1000,
+    # )
 
-    success = await connection.start(options)
+    # success = await connection.start(options)
 
-    if not success:
-        logger.error("❌ Deepgram websocket failed")
-        return
+    # if not success:
+    #     logger.error("❌ Deepgram websocket failed")
+    #     return
 
-    logger.info("✅ Deepgram connection started")
+    # logger.info("✅ Deepgram connection started")
 
-    asyncio.create_task(keep_alive(connection))
+    # asyncio.create_task(keep_alive(connection))
 
     async def forward_audio():
         # logger.info("🚀 forward_audio started")
@@ -294,7 +420,7 @@ async def run_bot():
                             logger.info("🎤 VAD: speech started")
 
                         if in_speech:
-                            await connection.send(chunk)
+                            await stt.send(chunk)
 
                     else:
                         speech_chunk_count   = 0
@@ -314,7 +440,9 @@ async def run_bot():
                                 )
  
                                 try:
-                                    await connection.finalize()
+                                    await stt.finalize(
+                                        bytes(speech_buffer)
+                                    )
                                     logger.info("✅ Deepgram finalize sent")
                                 except Exception as e:
                                     logger.error(f"Finalize error: {e}")
@@ -341,6 +469,6 @@ async def run_bot():
         logger.info("👋 Stopped by user")
     finally:
         forward_task.cancel()
-        await connection.finish()
+        await stt.stop()
         await transport.stop()
         logger.info("✅ Bot shut down cleanly")

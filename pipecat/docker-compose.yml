@@ -16,7 +16,7 @@ services:
       - ./certs:/certs
       - ./recordings:/app/recordings
     environment:
-      - ANNOUNCED_IP=192.168.29.230
+      - ANNOUNCED_IP=10.161.40.137
       - REDIS_HOST=127.0.0.1
       - REDIS_PORT=6379
     depends_on:

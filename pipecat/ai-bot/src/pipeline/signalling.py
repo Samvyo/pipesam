@@ -10,13 +10,21 @@ class BotSignalling:
         self.server_url = server_url
         self.token      = token
         self.rtp_port   = rtp_port
+        
         self.ws         = None
         self.transport_id  = None
         self.consumer_id   = None
         self.sender        = None
 
+        self.ssrc_to_peer = {}
+        self.current_speaker = "unknown"
+
         # bot.py waits on this before reading RTP packets
         self.ready = asyncio.Event()
+
+        self._pending      = {}
+
+        self.consumer_lock = asyncio.Lock()
 
     # Establish a secure WebSocket connection to the signalling server.
     async def connect(self):
@@ -29,7 +37,7 @@ class BotSignalling:
         logger.info("✅ Bot connected to signalling server")
 
     # Configure MediaSoup consumer transport and start receiving browser audio via RTP.
-    async def setup(self, room_id: str, producer_id: str):
+    async def setup(self, room_id: str):
 
         # RPC 1: Join the room so the server can register the bot as a room participant
         await self._send({'type': 'join-room'})
@@ -52,29 +60,49 @@ class BotSignalling:
         logger.info(f"✅ Consumer transport connected → port {self.rtp_port}")
 
 
-        # RPC 3: Create a consumer for the browser's audio producer on the bot transport.
-        await self._send({
-            'type':        'create-bot-consumer',
-            'transportId': self.transport_id,
-            'producerId':  producer_id,
-        })
-        response = await self._wait_for('bot-consumer-created')
-        self.consumer_id = response['consumerId']
-        logger.info(
-            f"🎧 Consumer created: {self.consumer_id} "
-            f"kind={response['kind']}"
-        )
+        # # RPC 3: Create a consumer for the browser's audio producer on the bot transport.
+        # await self._send({
+        #     'type':        'create-bot-consumer',
+        #     'transportId': self.transport_id,
+        # })
+        # response = await self._wait_for('bot-consumer-created')
 
-        # RPC 4: Resume the consumer so RTP packets begin flowing from MediaSoup to the bot.
-        await self._send({
-            'type':        'resume-bot-consumer',
-            'transportId': self.transport_id,
-        })
-        await self._wait_for('bot-consumer-resumed')
-        logger.info("▶️  RTP flowing — browser audio arriving at port 55000")
+        # logger.info(
+        #     f"FULL BOT-CONSUMER RESPONSE: {response}"
+        # )
 
-        # Signal that RTP is ready and the bot can begin reading audio packets.
-        self.ready.set()
+        # ssrc = response["rtpParameters"]["encodings"][0]["ssrc"]
+
+        # peer_id = response.get(
+        #     "peerId",
+        #     "unknown"
+        # )
+
+        # self.ssrc_to_peer[ssrc] = peer_id
+
+        # # TEMPORARY: single-user testing
+        # self.current_speaker = peer_id
+
+        # logger.info(
+        #     f"🗣 SSRC MAP: "
+        #     f"{ssrc} -> {peer_id}"
+        # )
+        # self.consumer_id = response['consumerId']
+        # logger.info(
+        #     f"🎧 Consumer created: {self.consumer_id} "
+        #     f"kind={response['kind']}"
+        # )
+
+        # # RPC 4: Resume the consumer so RTP packets begin flowing from MediaSoup to the bot.
+        # await self._send({
+        #     'type':        'resume-bot-consumer',
+        #     'transportId': self.transport_id,
+        # })
+        # await self._wait_for('bot-consumer-resumed')
+        # logger.info("▶️  RTP flowing — browser audio arriving at port 55000")
+
+        # # Signal that RTP is ready and the bot can begin reading audio packets.
+        # self.ready.set()
 
     # Configure MediaSoup producer transport and start sending bot audio via RTP.
     async def setup_send_path(self):
@@ -117,13 +145,103 @@ class BotSignalling:
         # asyncio.create_task(
         #     self.sender.stream_tone(freq=440.0)
         # )
-    
+
+    async def create_consumer(
+        self,
+        producer_id
+    ):
+        async with self.consumer_lock:
+            await self._send({
+                'type': 'create-bot-consumer',
+                'transportId': self.transport_id,
+                'producerId': producer_id,
+            })
+
+            response = await self._wait_for(
+                'bot-consumer-created'
+            )
+
+            ssrc = response["rtpParameters"]["encodings"][0]["ssrc"]
+
+            peer_id = response.get(
+                "peerId",
+                "unknown"
+            )
+
+            self.ssrc_to_peer[ssrc] = peer_id
+
+            # self.current_speaker = peer_id
+
+            logger.info(
+                f"🗣 SSRC MAP: {ssrc} -> {peer_id}"
+            )
+
+            await self._send({
+                'type': 'resume-bot-consumer',
+                'transportId': self.transport_id,
+            })
+            await self._wait_for(
+                'bot-consumer-resumed'
+            )
+
+            logger.info(
+                f"🎧 Consumer created for {peer_id}"
+            )
+
+            self.ready.set()
     # Continuously listen for signalling messages from the server.
+    # async def listen(self):
+    #     try:
+    #         async for raw in self.ws:
+    #             msg = json.loads(raw)
+    #             logger.debug(f"[signalling] ← {msg['type']}")
+    #             # logger.info(
+    #             #     f"[signalling] ← {msg}"
+    #             # )
+
+    #             if msg["type"] == "new-audio-producer":
+
+    #                 logger.info(
+    #                     f"🎤 New producer detected: "
+    #                     f"{msg['peerId']}"
+    #                 )
+
+    #                 await self.create_consumer(
+    #                     msg["producerId"]
+    #                 )
+
+    #     except Exception as e:
+    #         logger.warning(f"[signalling] connection closed: {e}")
+
     async def listen(self):
         try:
             async for raw in self.ws:
                 msg = json.loads(raw)
-                logger.debug(f"[signalling] ← {msg['type']}")
+                logger.info(f"[signalling] ← {msg}") 
+
+                msg_type = msg['type']
+
+                # deliver to any _wait_for caller first
+                if msg_type in self._pending:
+                    fut = self._pending.pop(msg_type)
+                    if not fut.done():
+                        fut.set_result(msg)
+                    continue
+
+                if msg_type == 'bot-error':
+                    logger.error(f"❌ Server error: {msg.get('message')}")
+                    for fut in self._pending.values():
+                        if not fut.done():
+                            fut.set_exception(Exception(msg.get('message')))
+                    self._pending.clear()
+                    continue
+
+                if msg_type == 'new-audio-producer':
+                    logger.info(f"🎤 New producer detected: {msg['peerId']}")
+                    asyncio.create_task(
+                        self.create_consumer(msg['producerId'])
+                    )
+
         except Exception as e:
             logger.warning(f"[signalling] connection closed: {e}")
 
@@ -134,23 +252,45 @@ class BotSignalling:
         logger.debug(f"[signalling] → {msg['type']}")
 
     # Wait for a specific server response while ignoring unrelated messages.
+    # async def _wait_for(self, msg_type: str) -> dict:
+    #     while True:
+    #         raw = await self.ws.recv()
+    #         msg = json.loads(raw)
+    #         logger.info(f"[signalling] ← {msg}")
+
+    #         if msg['type'] == msg_type:
+    #             return msg
+
+    #         if msg['type'] == 'bot-error':
+    #             logger.error(
+    #                 f"❌ Server error: {msg.get('message')}"
+    #             )
+    #             raise Exception(
+    #                 f"Server error: {msg.get('message')}"
+    #             )
+
     async def _wait_for(self, msg_type: str) -> dict:
-        while True:
-            raw = await self.ws.recv()
-            msg = json.loads(raw)
-            logger.info(f"[signalling] ← {msg}")
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        self._pending[msg_type] = fut
+        return await fut
+    
+    async def send_transcript(
+        self,
+        speaker,
+        text,
+        confidence,
+        ts
+    ):
+        await self._send({
+            "type": "transcript",
+            "speaker": speaker,
+            "text": text,
+            "confidence": confidence,
+            "ts": ts
+        })
 
-            if msg['type'] == msg_type:
-                return msg
-
-            if msg['type'] == 'bot-error':
-                logger.error(
-                    f"❌ Server error: {msg.get('message')}"
-                )
-                raise Exception(
-                    f"Server error: {msg.get('message')}"
-                )
-       
+    
     # Close RTP sender and WebSocket connection during shutdown.  
     async def close(self):
         if self.sender:
