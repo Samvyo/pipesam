@@ -1,5 +1,4 @@
 import asyncio
-
 import anthropic
 import time
 from loguru import logger
@@ -20,10 +19,13 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 import torch
 import numpy as np
 
+import re
+
 from .whisper_stt import WhisperSTT
 
 CHUNK = 1024
-RATE = 16000 
+RATE = 16000  
+TTS_SAMPLE_RATE = 24000 
 
 # Silero VAD expects 512 samples at 16kHz
 VAD_CHUNK_SAMPLES = 512
@@ -37,8 +39,21 @@ SILENCE_CONFIRM_CHUNKS = 20  # 20 × 32ms = ~640ms of silence ends utterance
 
 conversation_history: list = []
 transcript_log: list = []
+
+# current TTS task — so we can cancel it on interrupt
+current_tts_task = None
+
+# participants in the room — updated from signalling
+room_participants: list = []
+
 is_speaking = False       # True while TTS is playing
 pipeline_start_time = 0
+
+# all currently-running speak_sentence tasks (for interruption)
+active_tts_tasks: list = []
+
+# queue of sentences waiting to be spoken — played one at a time
+tts_queue: asyncio.Queue = asyncio.Queue()
 
 def load_silero_vad():
     # Load Silero VAD model from torch hub
@@ -64,97 +79,276 @@ def vad_is_speech(model, pcm_bytes: bytes) -> bool:
     confidence = model(tensor, RATE).item()
     return confidence > 0.5   # threshold — tune if needed
 
+def contains_wake_word(text: str) -> bool:
+    """
+    Check if transcript contains the wake word.
+    Removes punctuation before checking so
+    'Hey, bot' matches wake word 'hey bot'.
+    """
+    cleaned = re.sub(r'[^\w\s]', '', text.lower().strip())
+    wake    = re.sub(r'[^\w\s]', '', Config.WAKE_WORD.lower().strip())
+    
+    result = wake in cleaned
+    logger.info(f"🔍 Wake word check: '{wake}' in '{cleaned}' → {result}")
+    return result
 
-async def ask_claude(user_text: str) -> str:
-    try:
-        conversation_history.append({
-            "role": "user",
-            "content": user_text
-        })
-        logger.info(f"🧠 Asking Claude: {user_text}")
-        client = anthropic.Anthropic(
-            api_key=Config.ANTHROPIC_API_KEY
+
+def get_text_after_wake_word(text: str) -> str:
+    """
+    Extract question after wake word.
+    'Hey, bot. What is Python?' → 'What is Python?'
+    """
+    # find wake word position ignoring punctuation
+    cleaned = re.sub(r'[^\w\s]', '', text.lower())
+    wake    = re.sub(r'[^\w\s]', '', Config.WAKE_WORD.lower())
+    
+    idx = cleaned.find(wake)
+    if idx == -1:
+        return text
+    
+    # calculate character position in original text
+    # count wake word length + some buffer for punctuation
+    wake_end = idx + len(wake)
+    
+    # now find same position in original text
+    clean_chars = 0
+    orig_pos    = 0
+    for i, ch in enumerate(text.lower()):
+        if re.match(r'[\w\s]', ch):
+            if clean_chars >= wake_end:
+                orig_pos = i
+                break
+            clean_chars += 1
+    
+    after = text[orig_pos:].strip().lstrip(",.!?- ")
+    return after if after else text
+
+def trim_conversation_history():
+    """
+    Keep only the last N turns in conversation history.
+    This prevents the context window from growing forever.
+    N = Config.LLM_CONTEXT_WINDOW (default 10 turns = 20 messages)
+    """
+    global conversation_history
+    max_messages = Config.LLM_CONTEXT_WINDOW * 2  # each turn = user + assistant
+    if len(conversation_history) > max_messages:
+        # keep the most recent messages
+        conversation_history = conversation_history[-max_messages:]
+        logger.info(
+            f"🔄 Context trimmed to {len(conversation_history)} messages"
         )
-        
-        llm_start = time.time()
 
-        response = client.messages.create(
-            model=Config.LLM_MODEL,
-            max_tokens=Config.LLM_MAX_TOKENS,
-            system=Config.SYSTEM_PROMPT,
-            messages=conversation_history
-        )
-        reply = response.content[0].text
-        conversation_history.append({
-            "role": "assistant",
-            "content": reply
-        })
-        llm_end = time.time()
-        logger.info(f"⏱️ LLM Latency: {llm_end - llm_start:.2f}s")
-        logger.info(f"🤖 Claude: {reply}")
-        return reply
-    except Exception as e:
-        logger.error(f"❌ Claude error: {e}")
-        return "Sorry, I had an error."
+summarise_tool = {
+    "name": "summarise_meeting",
+    "description": "Summarize the meeting discussion so far based on the transcript.",
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+    }
+}
+
+def generate_meeting_summary() -> str:
+    """Build a simple summary string from transcript_log."""
+    if not transcript_log:
+        return "No conversation has happened yet."
+
+    lines = []
+    for entry in transcript_log:
+        lines.append(f"{entry['speaker']}: {entry['text']}")
+
+    return "Meeting transcript so far:\n" + "\n".join(lines)
 
 
-async def speak(text: str, deepgram, transport: MediasoupTransport):
-    global is_speaking, pipeline_start_time  # should_interrupt, pipeline_start_time
+async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
+    """
+    Stream Claude response token by token.
+    Send each complete sentence to TTS immediately.
+    Supports tool use (summarise_meeting).
+    """
+    global current_tts_task
+
+    conversation_history.append({
+        "role": "user",
+        "content": user_text
+    })
+    trim_conversation_history()
+
+    logger.info(f"🧠 Asking Claude (streaming): {user_text}")
+
+    client = anthropic.Anthropic(api_key=Config.ANTHROPIC_API_KEY)
+
+    system_prompt = Config.build_system_prompt(
+        participants=room_participants,
+        meeting_title=Config.MEETING_TITLE
+    )
+
+    sentence_endings = re.compile(r'[.!?]')
+    llm_start = time.time()
+
+    # loop runs at most twice: once for initial reply, again if a tool was called
+    while True:
+        full_reply = ""
+        sentence_buffer = ""
+        tool_calls = []
+        first_token_logged = False
+
+        try:
+            with client.messages.stream(
+                model=Config.LLM_MODEL,
+                max_tokens=Config.LLM_MAX_TOKENS,
+                system=system_prompt,
+                tools=[summarise_tool],
+                messages=conversation_history
+            ) as stream:
+
+                for event in stream:
+                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                        if not first_token_logged:
+                            first_token_logged = True
+                            first_token_time = time.time()
+                            logger.info(f"⚡ First token latency: {time.time() - llm_start:.2f}s")
+
+                        text_chunk = event.delta.text
+                        full_reply += text_chunk
+                        sentence_buffer += text_chunk
+
+                        if sentence_endings.search(sentence_buffer):
+                            parts = sentence_endings.split(sentence_buffer)
+                            for part in parts[:-1]:
+                                sentence = part.strip()
+                                if sentence:
+                                    tts_send_time = time.time()
+                                    logger.info(
+                                        f"🔊 Queuing sentence for TTS: {sentence} | "
+                                        f"⚡ first-token→TTS-queue latency: "
+                                        f"{(tts_send_time - first_token_time)*1000:.0f}ms"
+                                    )
+                                    tts_queue.put_nowait(sentence)
+                            sentence_buffer = parts[-1]
+
+                    if event.type == "content_block_stop":
+                        block = getattr(event, "content_block", None)
+                        if block and block.type == "tool_use":
+                            tool_calls.append(block)
+
+                if sentence_buffer.strip():
+                    tts_queue.put_nowait(sentence_buffer.strip())
+
+                final_message = stream.get_final_message()
+
+            conversation_history.append({
+                "role": "assistant",
+                "content": final_message.content
+            })
+
+            if not tool_calls:
+                logger.info(f"⏱️ Total LLM Latency: {time.time() - llm_start:.2f}s")
+                logger.info(f"🤖 Claude: {full_reply}")
+                break
+
+            # execute requested tool(s) and send result back for final reply
+            tool_results = []
+            for tool_call in tool_calls:
+                if tool_call.name == "summarise_meeting":
+                    summary_text = generate_meeting_summary()
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": summary_text
+                    })
+
+            conversation_history.append({
+                "role": "user",
+                "content": tool_results
+            })
+            # loop again -> Claude streams its final spoken reply using the tool result
+
+        except Exception as e:
+            logger.error(f"❌ Claude streaming error: {e}")
+            tts_queue.put_nowait("Sorry, I had a problem. Could you repeat that?")
+            break
+
+async def speak_sentence(text: str, transport: MediasoupTransport):
+    """
+    Send a single sentence to TTS and play it.
+    Can be cancelled by interrupt.
+    """
+    global is_speaking
+
+    if not text or len(text.strip()) < 2:
+        return
+
     is_speaking = True
-    logger.info("🔊 Speaking...")
+    task = asyncio.current_task()
+    active_tts_tasks.append(task)
+    logger.info(f"🔊 Speaking: '{text}'")
 
     try:
+        from deepgram import DeepgramClient
+        deepgram  = DeepgramClient(Config.DEEPGRAM_API_KEY)
         tts_start = time.time()
+
         response = await deepgram.asyncspeak.v("1").stream(
             {"text": text},
             options={
-                "model": Config.TTS_VOICE,
-                "encoding": "linear16",
-                "sample_rate": RATE,
+                "model":       Config.TTS_VOICE,
+                "encoding":    "linear16",
+                "sample_rate": TTS_SAMPLE_RATE,
             }
         )
 
-        # Read all audio data at once
         audio_data = response.stream.read()
 
-        tts_end = time.time()
-        logger.info(f"⏱️ TTS Latency: {tts_end - tts_start:.2f}s")
+        if not audio_data:
+            logger.warning("⚠️ TTS returned empty audio")
+            return
 
-        # TTS audio ready — speaker output disabled for now
-        # will be sent back to browser via RTP in future
         logger.info(
-            f"🔊 TTS ready: {len(audio_data)} bytes"
+            f"⏱️ TTS latency: {time.time() - tts_start:.2f}s | "
+            f"{len(audio_data)} bytes"
         )
-        frame = AudioRawFrame(
-            audio=audio_data,
-            sample_rate=RATE,
-            num_channels=1
-        )
-        await transport.output().process_frame(frame, direction=None)
 
+        # send in small chunks — RTP sender needs this
+        # 1024 samples × 2 bytes = 2048 bytes per chunk = 64ms of audio
+        chunk_size = 1024 * 2
+        sleep_per_chunk = 1024 / TTS_SAMPLE_RATE 
+        for i in range(0, len(audio_data), chunk_size):
+            chunk = audio_data[i:i + chunk_size]
+            frame = AudioRawFrame(
+                audio=chunk,
+                sample_rate=TTS_SAMPLE_RATE,
+                num_channels=1
+            )
+            await transport.output().process_frame(frame, direction=None)
+            # small pause so RTP sender keeps up with playback speed
+            await asyncio.sleep(sleep_per_chunk)
+
+    except asyncio.CancelledError:
+        logger.info("🛑 TTS cancelled — interrupt")
     except Exception as e:
         logger.error(f"TTS error: {e}")
-
     finally:
-        await asyncio.sleep(1.0)
-
         is_speaking = False
-
-        pipeline_end = time.time()
-
-        if pipeline_start_time != 0:
-            total_latency = (
-                pipeline_end - pipeline_start_time
-            )
-
-            logger.info(
-                f"🚀 Total Pipeline Latency: "
-                f"{total_latency:.2f}s"
-            )
-
-        pipeline_start_time = 0
-
+        if task in active_tts_tasks:
+            active_tts_tasks.remove(task)
         logger.info("🎤 Listening again...")
+
+async def tts_worker(transport: MediasoupTransport):
+    """
+    Single worker — pulls sentences off the queue and speaks them
+    one at a time, so audio never overlaps and stays at normal speed.
+    """
+    while True:
+        text = await tts_queue.get()
+        try:
+            await speak_sentence(text, transport)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"TTS worker error: {e}")
+        finally:
+            tts_queue.task_done()
 
 
 async def keep_alive(connection):
@@ -174,10 +368,11 @@ async def keep_alive(connection):
 
 
 async def run_bot():
-    global is_speaking, pipeline_start_time
+    global is_speaking, pipeline_start_time ,room_participants, current_tts_task
 
     Config.validate()
     logger.info("🚀 Starting pipeline...")
+    logger.info(f"🎙️ Wake word: '{Config.WAKE_WORD}'")
 
     # Load Silero VAD model once at startup
     vad_model = load_silero_vad()
@@ -200,112 +395,72 @@ async def run_bot():
     await transport.start()
     logger.info("✅ MediaSoup transport started")
 
-   
-    # async def on_transcript(self, result, **kwargs):
-    #     global pipeline_start_time
+    asyncio.create_task(tts_worker(transport))
 
-    #     # logger.info(
-    #     #     f"🔥 RAW TRANSCRIPT EVENT: {result}"
-    #     # )
+    # update participants list from signalling
+    # this runs every time a peer joins or leaves
+    async def refresh_participants():
+        while True:
+            try:
+                peers = list(
+                    transport._signalling.ssrc_to_peer.values()
+                )
+                # add any peers from the room peer list
+                room_participants.clear()
+                room_participants.extend(set(peers))
+            except Exception:
+                pass
+            await asyncio.sleep(5)
 
+    asyncio.create_task(refresh_participants())
 
-    #     if not result.is_final:
-    #         return
-
-    #     alt = result.channel.alternatives[0]
-
-    #     sentence = alt.transcript.strip()
-    #     confidence = alt.confidence
-
-    #     logger.info(
-    #         f"🔍 Deepgram Result | "
-    #         f"is_final={result.is_final} | "
-    #         f"text='{sentence}' | "
-    #         f"confidence={confidence:.2f}"
-    #     )
-
-
-    #     if not sentence:
-    #         return
-
-    #     logger.info(
-    #         f"📝 Transcript: {sentence}"
-    #     )
-
-    #     logger.info(
-    #         f"🎯 Confidence: {confidence:.2f}"
-    #     )
-
-    #     # confidence filtering
-    #     if confidence < 0.70:
-    #         logger.warning(
-    #             f"❌ Transcript rejected "
-    #             f"(confidence={confidence:.2f})"
-    #         )
-    #         return
-
-    #     if is_speaking:
-    #         return
-
-    #     logger.info(
-    #         f"✅ Transcript accepted: {sentence}"
-    #     )
-
-    #     transcript_event = {
-    #         "speaker": transport._signalling.current_speaker,
-    #         "text": sentence,
-    #         "confidence": confidence,
-    #         "ts": time.time()
-    #     }
-
-    #     transcript_log.append(transcript_event)
-
-    #     await transport._signalling.send_transcript(
-    #         speaker=transcript_event["speaker"],
-    #         text=transcript_event["text"],
-    #         confidence=transcript_event["confidence"],
-    #         ts=transcript_event["ts"]
-    #     )
-
-    #     logger.info(
-    #         f"📄 Transcript Event: "
-    #         f"{transcript_event}"
-    #     )
-
-    #     logger.info(
-    #         f"📚 Transcript Log Count: "
-    #         f"{len(transcript_log)}"
-    #     )
-
-    #     pipeline_start_time = time.time()
-
-    #     logger.info("🧠 Calling Claude")
-
-    #     reply = await ask_claude(sentence)
-
-    #     logger.info("🧠 Claude completed")
-
-        # await speak(reply, deepgram, transport)
-    
-    async def on_transcript(text, confidence=1.0):
-        global pipeline_start_time
+    # transcript callback
+    async def on_transcript(text: str, confidence: float):
+        global pipeline_start_time, current_tts_task
 
         if not text:
             return
+        
+        logger.info(f"📝 Transcript: {text}")
+        logger.info(f"🎯 Confidence: {confidence:.2f}")
 
         if confidence < 0.70:
-            logger.warning(
-                f"❌ Transcript rejected "
-                f"(confidence={confidence:.2f})"
-            )
+            logger.warning(f"❌ Transcript rejected (confidence={confidence:.2f})")
             return
 
+        # ── INTERRUPT HANDLING (any speech while bot is talking) ───
+        global is_speaking, active_tts_tasks
         if is_speaking:
+            logger.info(f"🛑 Interrupt detected (any speech) — cancelling TTS: '{text}'")
+            for t in active_tts_tasks:
+                if not t.done():
+                    t.cancel()
+            active_tts_tasks.clear()
+
+            # drop any sentences still waiting in the queue
+            while not tts_queue.empty():
+                try:
+                    tts_queue.get_nowait()
+                    tts_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+
+            is_speaking = False
+            await asyncio.sleep(0.1)
+
+        # ── WAKE WORD CHECK ───────────────────────────────────────
+        if not contains_wake_word(text):
+            logger.info(f"💤 No wake word — ignoring: '{text}'")
             return
 
-        logger.info(
-            f"✅ Transcript accepted: {text}"
-        )
+        logger.info(f"🔔 Wake word detected in: '{text}'")
+
+        # ── EXTRACT QUESTION ──────────────────────────────────────
+        question = get_text_after_wake_word(text)
+        if not question or question.lower() == text.lower():
+            question = "hey bot, I heard you. How can I help?"
+
+        logger.info(f"❓ Question for Claude: '{question}'")
 
         transcript_event = {
             "speaker": transport._signalling.current_speaker,
@@ -313,7 +468,6 @@ async def run_bot():
             "confidence": confidence,
             "ts": time.time()
         }
-
         transcript_log.append(transcript_event)
 
         await transport._signalling.send_transcript(
@@ -324,48 +478,14 @@ async def run_bot():
         )
 
         pipeline_start_time = time.time()
+        logger.info("🧠 Calling Claude (streaming)")
 
-        logger.info("🧠 Calling Claude")
-
-        reply = await ask_claude(text)
-
-        logger.info("🧠 Claude completed")
+        current_tts_task = asyncio.create_task(ask_claude_streaming(question, transport))
 
     stt.on_transcript(on_transcript)
 
     await stt.start()
 
-
-    # await speak(reply, deepgram, transport)
-        
-    # async def on_error(self, error, **kwargs):
-    #     logger.error(f"Deepgram error: {error}")
-
-    # connection.on(LiveTranscriptionEvents.Transcript, on_transcript)
-    # connection.on(LiveTranscriptionEvents.Error, on_error)
-
-    # options = LiveOptions(
-    #     model=Config.STT_MODEL,
-    #     language=Config.STT_LANGUAGE,
-    #     smart_format=True,
-    #     interim_results= True,
-    #     encoding="linear16",
-    #     channels=1,
-    #     sample_rate=RATE,
-    #     # utterance_end_ms=2000,
-    #     # vad_events=True, 
-    #     endpointing= 1000,
-    # )
-
-    # success = await connection.start(options)
-
-    # if not success:
-    #     logger.error("❌ Deepgram websocket failed")
-    #     return
-
-    # logger.info("✅ Deepgram connection started")
-
-    # asyncio.create_task(keep_alive(connection))
 
     async def forward_audio():
         # logger.info("🚀 forward_audio started")
@@ -384,8 +504,8 @@ async def run_bot():
                 # logger.info(f"PCM received: {len(pcm)} bytes")
                 if not pcm:
                     continue
-                if is_speaking:
-                    continue
+                # if is_speaking:
+                #     continue
                 
                 # accumulate into vad_buffer
                 vad_buffer.extend(pcm)
@@ -440,10 +560,11 @@ async def run_bot():
                                 )
  
                                 try:
+                                    logger.info(f"🔧 CALLING finalize() with {len(speech_buffer)} bytes")
                                     await stt.finalize(
                                         bytes(speech_buffer)
                                     )
-                                    logger.info("✅ Deepgram finalize sent")
+                                    logger.info("🔧 finalize() RETURNED")
                                 except Exception as e:
                                     logger.error(f"Finalize error: {e}")
 

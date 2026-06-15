@@ -1013,7 +1013,7 @@ if (data.type === 'rtp-capabilities') {
       const transport = await room.router.createWebRtcTransport({
         listenIps: [{ 
           ip: "0.0.0.0",
-          announcedIp: process.env.ANNOUNCED_IP || "10.161.40.137",// ← change to your laptop IP for phone testing
+          announcedIp: process.env.ANNOUNCED_IP || "192.168.29.128",// ← change to your laptop IP for phone testing
         }],
         enableUdp: true,   // faster, preferred
         enableTcp: true,   // fallback if UDP blocked
