@@ -14,6 +14,11 @@ from .deepgram_stt import DeepgramSTT
 from .whisper_stt import WhisperSTT
 from .mediasoup_transport import MediasoupTransport
 
+from .tts.cartesia_tts import CartesiaTTS
+from .tts.deepgram_tts import DeepgramTTS
+
+from .audio_utils import normalize_audio
+
 from pipecat.frames.frames import AudioRawFrame
 os.environ['PYTHONWARNINGS'] = 'ignore'
 import torch
@@ -21,11 +26,10 @@ import numpy as np
 
 import re
 
-from .whisper_stt import WhisperSTT
 
 CHUNK = 1024
 RATE = 16000  
-TTS_SAMPLE_RATE = 24000 
+# TTS_SAMPLE_RATE = 24000 
 
 # Silero VAD expects 512 samples at 16kHz
 VAD_CHUNK_SAMPLES = 512
@@ -54,6 +58,12 @@ active_tts_tasks: list = []
 
 # queue of sentences waiting to be spoken — played one at a time
 tts_queue: asyncio.Queue = asyncio.Queue()
+tts = None
+
+last_llm_token_time = None
+
+first_audio_measured= False
+
 
 def load_silero_vad():
     # Load Silero VAD model from torch hub
@@ -167,6 +177,10 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
     Supports tool use (summarise_meeting).
     """
     global current_tts_task
+    global last_llm_token_time
+    global first_audio_measured
+
+    first_audio_measured = False
 
     conversation_history.append({
         "role": "user",
@@ -210,22 +224,35 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
                             logger.info(f"⚡ First token latency: {time.time() - llm_start:.2f}s")
 
                         text_chunk = event.delta.text
+                        last_llm_token_time = time.time()
+
                         full_reply += text_chunk
                         sentence_buffer += text_chunk
 
-                        if sentence_endings.search(sentence_buffer):
-                            parts = sentence_endings.split(sentence_buffer)
-                            for part in parts[:-1]:
-                                sentence = part.strip()
-                                if sentence:
+                        phrase_endings = re.compile(r'[.!?;:]')
+
+                        if phrase_endings.search(sentence_buffer):
+
+                            parts = re.split(r'([.!?;:])', sentence_buffer)
+
+                            while len(parts) >= 2:
+
+                                phrase = (parts[0] + parts[1]).strip()
+
+                                if phrase:
                                     tts_send_time = time.time()
+
                                     logger.info(
-                                        f"🔊 Queuing sentence for TTS: {sentence} | "
+                                        f"🔊 Queuing TTS chunk: {phrase} | "
                                         f"⚡ first-token→TTS-queue latency: "
                                         f"{(tts_send_time - first_token_time)*1000:.0f}ms"
                                     )
-                                    tts_queue.put_nowait(sentence)
-                            sentence_buffer = parts[-1]
+
+                                    tts_queue.put_nowait(phrase)
+
+                                parts = parts[2:]
+
+                            sentence_buffer = "".join(parts)
 
                     if event.type == "content_block_stop":
                         block = getattr(event, "content_block", None)
@@ -270,11 +297,7 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
             break
 
 async def speak_sentence(text: str, transport: MediasoupTransport):
-    """
-    Send a single sentence to TTS and play it.
-    Can be cancelled by interrupt.
-    """
-    global is_speaking
+    global is_speaking, last_llm_token_time, first_audio_measured
 
     if not text or len(text.strip()) < 2:
         return
@@ -285,43 +308,43 @@ async def speak_sentence(text: str, transport: MediasoupTransport):
     logger.info(f"🔊 Speaking: '{text}'")
 
     try:
-        from deepgram import DeepgramClient
-        deepgram  = DeepgramClient(Config.DEEPGRAM_API_KEY)
         tts_start = time.time()
 
-        response = await deepgram.asyncspeak.v("1").stream(
-            {"text": text},
-            options={
-                "model":       Config.TTS_VOICE,
-                "encoding":    "linear16",
-                "sample_rate": TTS_SAMPLE_RATE,
-            }
-        )
+        # ── STEP 1: collect all chunks from TTS ──────────────────
+        raw_chunks = []
+        first_chunk_received = False
 
-        audio_data = response.stream.read()
+        async for audio_data in tts.stream(text):
+            if not first_chunk_received:
+                first_chunk_received = True
 
-        if not audio_data:
-            logger.warning("⚠️ TTS returned empty audio")
-            return
+                # latency logging on first chunk arriving
+                if not first_audio_measured and last_llm_token_time:
+                    first_audio_measured = True
+                    logger.info(
+                        f"🎤 TTS-to-First-Audio Latency: "
+                        f"{(time.time() - last_llm_token_time) * 1000:.0f}ms"
+                    )
+                logger.info(f"⚡ First audio latency: {(time.time() - tts_start) * 1000:.0f}ms")
 
-        logger.info(
-            f"⏱️ TTS latency: {time.time() - tts_start:.2f}s | "
-            f"{len(audio_data)} bytes"
-        )
+            raw_chunks.append(audio_data)
 
-        # send in small chunks — RTP sender needs this
-        # 1024 samples × 2 bytes = 2048 bytes per chunk = 64ms of audio
+        # ── STEP 2: normalize ONCE on full audio ─────────────────
+        full_audio = b"".join(raw_chunks)
+        full_audio = normalize_audio(full_audio, Config.TARGET_DBFS)  # ← once, not 78 times
+
+        # ── STEP 3: send to RTP in small chunks ──────────────────
         chunk_size = 1024 * 2
-        sleep_per_chunk = 1024 / TTS_SAMPLE_RATE 
-        for i in range(0, len(audio_data), chunk_size):
-            chunk = audio_data[i:i + chunk_size]
+        sleep_per_chunk = 1024 / Config.TTS_SAMPLE_RATE
+
+        for i in range(0, len(full_audio), chunk_size):
+            chunk = full_audio[i:i + chunk_size]
             frame = AudioRawFrame(
                 audio=chunk,
-                sample_rate=TTS_SAMPLE_RATE,
+                sample_rate=Config.TTS_SAMPLE_RATE,
                 num_channels=1
             )
             await transport.output().process_frame(frame, direction=None)
-            # small pause so RTP sender keeps up with playback speed
             await asyncio.sleep(sleep_per_chunk)
 
     except asyncio.CancelledError:
@@ -333,7 +356,6 @@ async def speak_sentence(text: str, transport: MediasoupTransport):
         if task in active_tts_tasks:
             active_tts_tasks.remove(task)
         logger.info("🎤 Listening again...")
-
 async def tts_worker(transport: MediasoupTransport):
     """
     Single worker — pulls sentences off the queue and speaks them
@@ -343,6 +365,10 @@ async def tts_worker(transport: MediasoupTransport):
         text = await tts_queue.get()
         try:
             await speak_sentence(text, transport)
+
+            # natural pause between sentences
+            await asyncio.sleep(0.25)
+
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -366,9 +392,49 @@ async def keep_alive(connection):
             pass
         await asyncio.sleep(5)
 
+async def comfort_noise_worker(transport):
+
+    logger.info("🎧 Comfort noise worker started")
+
+    while True:
+
+        try:
+
+            if not is_speaking:
+
+                logger.debug("🔇 Sending comfort noise")
+
+                silence = b"\x00" * (1024 * 2)
+
+                frame = AudioRawFrame(
+                    audio=silence,
+                    sample_rate=Config.TTS_SAMPLE_RATE,
+                    num_channels=1
+                )
+
+                await transport.output().process_frame(
+                    frame,
+                    direction=None
+                )
+
+            await asyncio.sleep(
+                1024 / Config.TTS_SAMPLE_RATE
+            )
+
+        except asyncio.CancelledError:
+            break
+
+        except Exception as e:
+            logger.error(
+                f"Comfort noise error: {e}"
+            )
 
 async def run_bot():
-    global is_speaking, pipeline_start_time ,room_participants, current_tts_task
+    global is_speaking
+    global pipeline_start_time
+    global room_participants
+    global current_tts_task
+    global tts
 
     Config.validate()
     logger.info("🚀 Starting pipeline...")
@@ -377,12 +443,6 @@ async def run_bot():
     # Load Silero VAD model once at startup
     vad_model = load_silero_vad()
 
-    # deepgram = DeepgramClient(Config.DEEPGRAM_API_KEY)
-    # logger.info("✅ Connected to Deepgram")
-
-    # connection = deepgram.listen.asynclive.v("1")
-
-    
     if Config.STT_BACKEND == "whisper":
         logger.info("🎙️ Using Whisper")
         stt = WhisperSTT()
@@ -391,11 +451,27 @@ async def run_bot():
         logger.info("🎙️ Using Deepgram")
         stt = DeepgramSTT()
 
+    if Config.TTS_PROVIDER == "cartesia":
+        logger.info("🔊 Using Cartesia TTS")
+        tts = CartesiaTTS()
+        await tts.connect() 
+
+    elif Config.TTS_PROVIDER == "kokoro":
+        logger.info("🔊 Using Kokoro TTS")
+        from .tts.kokoro_tts import KokoroTTS
+        tts = KokoroTTS()
+
+    else:
+        logger.info("🔊 Using Deepgram TTS")
+        tts = DeepgramTTS()
+
     transport = MediasoupTransport()
     await transport.start()
     logger.info("✅ MediaSoup transport started")
 
     asyncio.create_task(tts_worker(transport))
+
+    asyncio.create_task(comfort_noise_worker(transport))
 
     # update participants list from signalling
     # this runs every time a peer joins or leaves
@@ -592,4 +668,6 @@ async def run_bot():
         forward_task.cancel()
         await stt.stop()
         await transport.stop()
+        if Config.TTS_PROVIDER == "cartesia":
+            await tts.close()  # ← close WebSocket cleanly on shutdown
         logger.info("✅ Bot shut down cleanly")

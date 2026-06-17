@@ -1,44 +1,70 @@
 import os
 from dotenv import load_dotenv
 
+# Load environment variables from .env file
 load_dotenv()
 
 class Config:
-    # Deepgram settings
+     # ── Speech-to-Text (STT) ─────────────────────────────────────────────────
     DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
     STT_MODEL: str = "nova-2"
     STT_LANGUAGE: str = os.getenv("STT_LANGUAGE", "multi")  # Default to "multi" for automatic language detection
-    TTS_VOICE: str = "aura-asteria-en"
-
     # STT Backend Selection
     STT_BACKEND: str = os.getenv("STT_BACKEND", "deepgram")
     WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "base")
 
+    # ── Large Language Model (LLM) ───────────────────────────────────────────
     # Anthropic settings
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     LLM_MODEL: str = "claude-haiku-4-5-20251001"  
     LLM_MAX_TOKENS: int = 300
-    # Wake word
-    WAKE_WORD: str = os.getenv("WAKE_WORD", "hey bot")
-
-    # Meeting context
-    MEETING_TITLE: str = os.getenv("MEETING_TITLE", "Team Meeting")
-
     # Rolling context window — how many turns to keep
     LLM_CONTEXT_WINDOW: int = int(os.getenv("LLM_CONTEXT_WINDOW", "10"))
-
     # Rate limiting — seconds between LLM calls per user
     LLM_RATE_LIMIT_SECONDS: float = float(os.getenv("LLM_RATE_LIMIT_SECONDS", "2.0")) 
 
-    # Audio settings
+
+    # ── Wake Word & Meeting Context ──────────────────────────────────────────
+    # Wake word
+    WAKE_WORD: str = os.getenv("WAKE_WORD", "hey bot")
+    # Meeting context
+    MEETING_TITLE: str = os.getenv("MEETING_TITLE", "Team Meeting")
+    
+
+      # ── Audio Input Settings ─────────────────────────────────────────────────
     SAMPLE_RATE: int = 16000
     CHUNK: int = 1024
 
-    # Signalling settings
+    # ── Signalling / WebRTC ──────────────────────────────────────────────────
     SIGNALLING_URL: str = os.getenv("SIGNALLING_URL", "wss://192.168.29.128:3000")
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
     BOT_ROOM_ID: str = os.getenv("BOT_ROOM_ID", "testroom")
     # BOT_PRODUCER_ID: str = os.getenv("BOT_PRODUCER_ID", "")
+
+
+     # ── Text-to-Speech (TTS) — Provider Selection ────────────────────────────
+    # Primary: Cartesia (cloud, low latency ~400ms)
+    # Fallback 1: Deepgram (cloud)
+    # Fallback 2: Kokoro (local, no network needed)
+    TTS_PROVIDER: str = os.getenv("TTS_PROVIDER", "cartesia")
+
+     # ── Cartesia TTS ─────────────────────────────────────────────────────────
+    CARTESIA_API_KEY: str = os.getenv("CARTESIA_API_KEY", "")
+    CARTESIA_VOICE_ID: str = os.getenv("CARTESIA_VOICE_ID", "")
+    CARTESIA_MODEL: str = os.getenv("CARTESIA_MODEL", "sonic-2")
+
+
+    # ── Kokoro TTS (local fallback) ──────────────────────────────────────────
+    KOKORO_ENABLED: bool = os.getenv("KOKORO_ENABLED", "true").lower() == "true"
+    KOKORO_VOICE: str = os.getenv("KOKORO_VOICE", "af_heart")
+
+    # ── TTS Audio Output Settings ────────────────────────────────────────────
+    TTS_SAMPLE_RATE: int = int(os.getenv("TTS_SAMPLE_RATE", "24000"))
+    TARGET_DBFS: float = float(os.getenv("TARGET_DBFS", "-18"))
+
+    # Failover settings
+    TTS_TIMEOUT_SECONDS: float = float(os.getenv("TTS_TIMEOUT_SECONDS", "5"))
+
 
     @staticmethod
     def build_system_prompt(participants: list, meeting_title: str) -> str:
@@ -72,15 +98,16 @@ class Config:
             if not cls.DEEPGRAM_API_KEY:
                 missing.append("DEEPGRAM_API_KEY")
 
-        # if cls.STT_BACKEND == "whisper":
-        #     if not cls.WHISPER_MODEL:
-        #         missing.append("WHISPER_MODEL")
         if not cls.ANTHROPIC_API_KEY:
             missing.append("ANTHROPIC_API_KEY")
         if not cls.BOT_TOKEN:
             missing.append("BOT_TOKEN")
-        # if not cls.BOT_PRODUCER_ID:
-        #     missing.append("BOT_PRODUCER_ID")
+        if cls.TTS_PROVIDER == "cartesia":
+            if not cls.CARTESIA_API_KEY:
+                missing.append("CARTESIA_API_KEY")
+
+            if not cls.CARTESIA_VOICE_ID:
+                missing.append("CARTESIA_VOICE_ID")
         if missing:
             raise ValueError(f"Missing in .env: {', '.join(missing)}")
         print("✅ Config OK - all keys found")

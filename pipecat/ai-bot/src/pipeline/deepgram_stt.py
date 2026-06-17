@@ -8,48 +8,74 @@ from deepgram import (
 from .config import Config
 
 CHUNK = 1024
-RATE  = 16000
+RATE  = 16000  # microphone input sample rate (Hz)
 
 
 class DeepgramSTT:
+    """
+    Deepgram live speech-to-text client.
+
+    Streams 32ms PCM chunks to Deepgram over a WebSocket and fires
+    the on_transcript callback whenever a final transcript arrives.
+    Automatically reconnects if the connection drops.
+    """
 
     def __init__(self):
-        self._client          = DeepgramClient(Config.DEEPGRAM_API_KEY)
-        self._connection      = self._client.listen.asynclive.v("1")
+        self._client           = DeepgramClient(Config.DEEPGRAM_API_KEY)
+        self._connection       = self._client.listen.asynclive.v("1")
         self._on_transcript_cb = None
+        self._running          = False
         logger.info("✅ DeepgramSTT initialized")
 
     def on_transcript(self, callback):
         self._on_transcript_cb = callback
 
+     # ── Event handlers ───────────────────────────────────────────────────────
+    async def _on_transcript_handler(self, self_inner, result, **kwargs):
+        if not result.is_final:
+            return
+        alt        = result.channel.alternatives[0]
+        text       = alt.transcript.strip()
+        confidence = alt.confidence
+        if not text:
+            return
+        if self._on_transcript_cb:
+            await self._on_transcript_cb(text, confidence)
+
+    async def _on_error_handler(self, error, **kwargs):
+        logger.error(f"Deepgram error: {error}")
+
+    async def _on_close_handler(self, close, **kwargs):
+        logger.warning("⚠️ Deepgram closed — reconnecting...")
+        if self._running:
+            await asyncio.sleep(1)
+            await self._connect()
+
+    async def _connect(self):
+        self._connection = self._client.listen.asynclive.v("1")
+        self._connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript_handler)
+        self._connection.on(LiveTranscriptionEvents.Error,      self._on_error_handler)
+        self._connection.on(LiveTranscriptionEvents.Close,      self._on_close_handler)
+        options = LiveOptions(
+            model=Config.STT_MODEL,
+            language=Config.STT_LANGUAGE,
+            smart_format=True,
+            interim_results=True,
+            encoding="linear16",
+            channels=1,
+            sample_rate=RATE,
+            endpointing=1000,
+        )
+        success = await self._connection.start(options)
+        if not success:
+            logger.error("❌ Deepgram reconnect failed")
+        else:
+            logger.info("✅ Deepgram reconnected")
+
     async def start(self):
-
-        async def _on_transcript(self_inner, result, **kwargs):
-            if not result.is_final:
-                return
-            alt        = result.channel.alternatives[0]
-            text       = alt.transcript.strip()
-            confidence = alt.confidence
-            logger.info(
-                f"🔍 Deepgram Result | "
-                f"is_final={result.is_final} | "
-                f"text='{text}' | "
-                f"confidence={confidence:.2f}"
-            )
-            if not text:
-                return
-            if self._on_transcript_cb:
-                await self._on_transcript_cb(text, confidence)
-
-        async def _on_error(self_inner, error, **kwargs):
-            logger.error(f"Deepgram error: {error}")
-
-        self._connection.on(
-            LiveTranscriptionEvents.Transcript, _on_transcript
-        )
-        self._connection.on(
-            LiveTranscriptionEvents.Error, _on_error
-        )
+        self._connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript_handler)
+        self._connection.on(LiveTranscriptionEvents.Error,      self._on_error_handler)
+        self._connection.on(LiveTranscriptionEvents.Close,      self._on_close_handler)
 
         options = LiveOptions(
             model=Config.STT_MODEL,
@@ -61,42 +87,38 @@ class DeepgramSTT:
             sample_rate=RATE,
             endpointing=1000,
         )
-
         success = await self._connection.start(options)
         if not success:
             raise RuntimeError("Deepgram websocket failed to start")
 
         logger.info("✅ Deepgram connection started")
+        self._running = True
         asyncio.create_task(self._keep_alive())
 
     async def send(self, pcm_chunk: bytes):
-        # streams each 32ms chunk to Deepgram live
         try:
             await self._connection.send(pcm_chunk)
         except Exception as e:
             logger.error(f"Deepgram send error: {e}")
 
     async def finalize(self, speech_buffer: bytes = None):
-        # speech_buffer not used by Deepgram
-        # Deepgram already received all chunks via send()
         try:
             await self._connection.finalize()
-            logger.info("✅ Deepgram finalize sent")
         except Exception as e:
             logger.error(f"Deepgram finalize error: {e}")
 
     async def stop(self):
+        self._running = False
         try:
             await self._connection.finish()
-        except Exception as e:
-            logger.error(f"Deepgram stop error: {e}")
+        except Exception:
+            pass
 
     async def _keep_alive(self):
-        # sends silence every 3s so Deepgram doesn't timeout
-        silence = b'\x00' * CHUNK * 2
-        while True:
+        while self._running:
             try:
-                await self._connection.send(silence)
+                if self._connection:
+                    await self._connection.keep_alive()
             except Exception:
-                break
+                pass
             await asyncio.sleep(3)
