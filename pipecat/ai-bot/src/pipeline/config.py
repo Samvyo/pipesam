@@ -41,12 +41,17 @@ class Config:
     BOT_ROOM_ID: str = os.getenv("BOT_ROOM_ID", "testroom")
     # BOT_PRODUCER_ID: str = os.getenv("BOT_PRODUCER_ID", "")
 
-
+    WELCOME_MESSAGE: str = os.getenv(
+        "WELCOME_MESSAGE",
+        "Hello everyone. I am Samvyo, your AI meeting assistant."
+    )
      # ── Text-to-Speech (TTS) — Provider Selection ────────────────────────────
     # Primary: Cartesia (cloud, low latency ~400ms)
     # Fallback 1: Deepgram (cloud)
     # Fallback 2: Kokoro (local, no network needed)
     TTS_PROVIDER: str = os.getenv("TTS_PROVIDER", "cartesia")
+    # ── Deepgram TTS ──────────────────────────────────────────────
+    TTS_VOICE: str = os.getenv("TTS_VOICE", "aura-asteria-en")
 
      # ── Cartesia TTS ─────────────────────────────────────────────────────────
     CARTESIA_API_KEY: str = os.getenv("CARTESIA_API_KEY", "")
@@ -80,10 +85,17 @@ class Config:
     Your behaviour:
     - Answer questions directly and helpfully
     - Keep responses short — 1 to 3 sentences maximum
-    - You can summarise the meeting when asked
+    - When the user asks for a meeting summary, use the summarise_meeting tool
+    - When the user asks for action items, always call the extract_action_items tool first.
+    - The extract_action_items tool contains the meeting transcript.
+    - Do not answer from memory.
+    - After receiving the transcript from the tool, extract action items with owner, task and due date.
+    - Always format each action item exactly like this, one per line:
+      **Owner:** <person name or "Unknown">
+      **Task:** <what needs to be done>
+      **Due Date:** <due date or "Not specified">
     - You are professional, concise and friendly
     - You remember the conversation history of this meeting
-
     Constraints:
     - Never make up facts
     - If you do not know something, say so

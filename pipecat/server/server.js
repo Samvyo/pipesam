@@ -22,7 +22,8 @@ const workers = new Map();
 const os = require('os');
 // let plainTransportPort = 42000;
 
-const JWT_SECRET = "mysecretkey"; // use env later
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) throw new Error("JWT_SECRET env var is required"); 
 // Serve client folder (correct path)
 app.use(express.static(path.join(__dirname, '../client')));
 
@@ -135,6 +136,9 @@ class Room {
     this.consumers = new Map();
     this.botTransports = new Map();
     this.botProducerTransports = new Map();
+
+    this.transcripts = [];
+    this.actionItems = [];
   }
 
   addPeer(peerId, ws) {
@@ -284,7 +288,85 @@ class RoomManager {
 
 const workerPool  = new WorkerPool();
 const roomManager = new RoomManager(workerPool);
+
+// const { spawn } = require("child_process");
+const botProcesses = new Map();
+
 const rateLimiter = new RateLimiter();
+
+function startBot(roomId) {
+
+  if (botProcesses.has(roomId)) {
+    console.log(`🤖 Bot already running for room ${roomId}`);
+    return;
+  }
+
+  console.log(`🚀 Starting bot for room ${roomId}`);
+
+  const token = jwt.sign(
+    { username: 'bot', roomId },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
+
+  // Find startBot() and change spawn:
+const bot = spawn(
+  '/opt/venv/bin/python3',     // ← not 'python3'
+  ['main.py'],
+  {
+    cwd: '/ai-bot',
+    env: {
+      ...process.env,
+      BOT_ROOM_ID: roomId,
+      BOT_TOKEN: token,
+      VIRTUAL_ENV: '/opt/venv',
+      PATH: `/opt/venv/bin:${process.env.PATH}`
+    }
+  }
+);
+
+  bot.stdout.on("data", (data) => {
+    console.log(`[BOT ${roomId}] ${data.toString()}`);
+  });
+
+  bot.stderr.on("data", (data) => {
+    console.error(`[BOT ${roomId}] ${data.toString()}`);
+  });
+
+  bot.on("exit", (code) => {
+    console.log(`🛑 Bot exited for room ${roomId}`);
+    botProcesses.delete(roomId);
+    console.log(
+      `Remaining bot rooms:`,
+      [...botProcesses.keys()]
+    );
+  });
+
+  botProcesses.set(roomId, bot);
+  console.log(
+    `✅ Bot registered for room ${roomId}`
+  );
+
+  console.log(
+    `Current bot rooms:`,
+    [...botProcesses.keys()]
+  );
+}
+
+function stopBot(roomId) {
+
+  const bot = botProcesses.get(roomId);
+
+  if (!bot) {
+    return;
+  }
+
+  console.log(`🛑 Stopping bot for room ${roomId}`);
+
+  bot.kill("SIGTERM");
+
+  botProcesses.delete(roomId);
+}
 
 // Root route
 app.get("/token", (req, res) => {
@@ -404,6 +486,62 @@ app.get('/metrics', async (req, res) => {
   res.set('Content-Type', metrics.register.contentType);
   res.end(await metrics.register.metrics());
 });
+
+app.get('/meeting/:roomId/summary', async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const room   = roomManager.get(roomId);
+
+    // Option 1: room is live — serve from memory (fastest)
+    if (room) {
+      return res.json({
+        roomId:      room.roomId,
+        source:      'memory',
+        transcript:  room.transcripts,
+        actionItems: room.actionItems || [],
+      });
+    }
+
+    // Option 3: room is gone — fall back to PostgreSQL
+    const actionItems = await getActionItemsFromDB(roomId);
+    return res.json({
+      roomId,
+      source:      'database',
+      transcript:  [],          // transcripts are not persisted to DB in your current setup
+      actionItems,
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function getActionItemsFromDB(roomId) {
+  const { Client } = require('pg');
+  const client = new Client({
+    host:     process.env.DB_HOST     || '127.0.0.1',
+    port:     parseInt(process.env.DB_PORT || '5432'),
+    database: process.env.DB_NAME     || 'samvyo',
+    user:     process.env.DB_USER     || 'samvyo',
+    password: process.env.DB_PASSWORD || '',
+  });
+  await client.connect();
+  try {
+    const result = await client.query(
+      `SELECT owner, task, due_date FROM action_items WHERE room_id = $1 ORDER BY created_at`,
+      [roomId]
+    );
+    return result.rows.map(row => ({
+      owner:    row.owner,
+      task:     row.task,
+      due_date: row.due_date ? String(row.due_date) : null
+    }));
+  } finally {
+    await client.end();
+  }
+}
+
 
 app.get('/health', (req, res) => {
   const workerStatuses = workerPool.workers.map((entry, i) => ({
@@ -838,6 +976,7 @@ if (data.type === 'rtp-capabilities') {
       }
       const roomId = ws.user.roomId;
       const peerId = ws.user.username;
+
       logger.info({ event: 'join-room', peerId, roomId });
       
       const room = await roomManager.getOrCreate(roomId);
@@ -845,8 +984,30 @@ if (data.type === 'rtp-capabilities') {
       ws.roomId = roomId;
       ws.peerId = peerId;
 
+
       const isRecovering = room.addPeer(peerId, ws);
+
+      if (peerId === "bot") {
+
+        room.broadcast(
+          {
+            type: "bot-ready"
+          },
+          "bot"
+        );
+
+        console.log("🤖 Bot ready event sent");
+      }
+
       rateLimiter.add(peerId);
+
+      const humans = room.listPeers().filter(p => p !== 'bot');
+      console.log(
+        `[BOT CHECK] room=${roomId} peer=${peerId} humans=${humans.length} botExists=${botProcesses.has(roomId)}`
+      );
+      if (humans.length === 1 && peerId !== 'bot' && !botProcesses.has(roomId)) {
+        startBot(roomId);
+      }
 
       // 🔥 refresh recovery cleanup
       if (isRecovering) {
@@ -1359,6 +1520,17 @@ if (data.type === 'rtp-capabilities') {
       }));
     }
 
+    else if (data.type === 'action-items') {
+
+      const room = roomManager.get(ws.roomId);
+
+      if (!room) return;
+
+      room.actionItems = data.items || [];
+
+      console.log(`📌 Stored ${room.actionItems.length} action items for room ${ws.roomId}:`, room.actionItems);
+    }
+
     else if (data.type === 'transcript') {
 
       const room = roomManager.get(ws.roomId);
@@ -1368,6 +1540,13 @@ if (data.type === 'rtp-capabilities') {
       console.log(
         `📝 Transcript: ${data.speaker}: ${data.text}`
       );
+
+      room.transcripts.push({
+        speaker: data.speaker,
+        text: data.text,
+        confidence: data.confidence,
+        ts: data.ts
+      });
 
       room.peers.forEach((client) => {
 
@@ -1938,7 +2117,9 @@ else if (data.type === 'stop-recording') {
     console.log(`✅ Cleanup complete for ${pId}`);
 
     // Delete room if empty
-    if (room.listPeers().length === 0) {
+    // if (room.listPeers().length === 0) {
+    const humanPeers = room.listPeers().filter(p => p !== 'bot');
+    if (humanPeers.length === 0) {
       if (room.ffmpegProcess) {
         room.ffmpegProcess.kill('SIGINT');
         room.ffmpegProcess = null;
@@ -1953,6 +2134,8 @@ else if (data.type === 'stop-recording') {
         room.recordingStartedBy = null; 
         console.log('🛑 Recording auto-stopped — room is empty');
      }
+    
+    stopBot(rId);
   
     await roomManager.delete(rId);    // ← await since delete() is now async
   }
@@ -2009,6 +2192,20 @@ async function gracefulShutdown(signal) {
 
   console.log(`\n⚠️ Received ${signal}`);
   console.log("🛑 Gracefully shutting down...");
+
+  // ─────────────────────────────────────────────
+  // Stop all running bots
+  // ─────────────────────────────────────────────
+  for (const [roomId, bot] of botProcesses.entries()) {
+
+    console.log(
+      `🛑 Stopping bot for room ${roomId}`
+    );
+
+    bot.kill("SIGTERM");
+  }
+
+  botProcesses.clear();
 
   try {
 

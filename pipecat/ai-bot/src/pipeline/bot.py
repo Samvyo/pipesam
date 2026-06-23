@@ -11,11 +11,11 @@ from loguru import logger
 import os
 from .config import Config
 from .deepgram_stt import DeepgramSTT
-from .whisper_stt import WhisperSTT
+# from .whisper_stt import WhisperSTT
 from .mediasoup_transport import MediasoupTransport
 
-from .tts.cartesia_tts import CartesiaTTS
-from .tts.deepgram_tts import DeepgramTTS
+# from .tts.cartesia_tts import CartesiaTTS
+# from .tts.deepgram_tts import DeepgramTTS
 
 from .audio_utils import normalize_audio
 
@@ -25,8 +25,7 @@ import torch
 import numpy as np
 
 import re
-
-
+from .action_items_db import save_action_items
 CHUNK = 1024
 RATE = 16000  
 # TTS_SAMPLE_RATE = 24000 
@@ -158,6 +157,18 @@ summarise_tool = {
     }
 }
 
+extract_action_items_tool = {
+    "name": "extract_action_items",
+    "description": (
+        "Use this tool whenever the user asks for action items, tasks, follow ups, owners, responsibilities, pending work, or next steps from the meeting."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+    }
+}
+
 def generate_meeting_summary() -> str:
     """Build a simple summary string from transcript_log."""
     if not transcript_log:
@@ -168,6 +179,38 @@ def generate_meeting_summary() -> str:
         lines.append(f"{entry['speaker']}: {entry['text']}")
 
     return "Meeting transcript so far:\n" + "\n".join(lines)
+
+def build_action_item_context() -> str:
+
+    logger.info(
+        f"Building action item context from {len(transcript_log)} transcripts"
+    )
+
+    if not transcript_log:
+        return "No transcript available."
+
+    lines = []
+
+    for entry in transcript_log:
+        lines.append(
+            f"{entry['speaker']}: {entry['text']}"
+        )
+
+    return "\n".join(lines)
+
+def parse_action_items_from_claude(text: str) -> list:
+    items = []
+    blocks = re.split(r'(?:^|\n)(?:#{1,3}|\*{1,2})?Action Item', text, flags=re.IGNORECASE)
+    if len(blocks) < 2:
+        blocks = ["", text]
+    for block in blocks[1:]:
+        def get(field):
+            m = re.search(rf'\*{{0,2}}{field}\*{{0,2}}\s*:?\*{{0,2}}\s*([^\n\*\-]+)', block, re.IGNORECASE)
+            return m.group(1).strip().rstrip('.,') if m else None
+        owner, task, due = get(r'Owner'), get(r'Task'), get(r'Due\s*Date')
+        if owner and task:
+            items.append({"owner": owner, "task": task, "due_date": due})
+    return items
 
 
 async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
@@ -208,11 +251,14 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
         first_token_logged = False
 
         try:
+            logger.info(
+                f"Transcript count before Claude call: {len(transcript_log)}"
+            )
             with client.messages.stream(
                 model=Config.LLM_MODEL,
                 max_tokens=Config.LLM_MAX_TOKENS,
                 system=system_prompt,
-                tools=[summarise_tool],
+                tools=[summarise_tool,extract_action_items_tool],
                 messages=conversation_history
             ) as stream:
 
@@ -264,19 +310,162 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
 
                 final_message = stream.get_final_message()
 
+                logger.info(
+                    f"FINAL MESSAGE CONTENT: {final_message.content}"
+                )
+
             conversation_history.append({
                 "role": "assistant",
                 "content": final_message.content
             })
 
             if not tool_calls:
-                logger.info(f"⏱️ Total LLM Latency: {time.time() - llm_start:.2f}s")
-                logger.info(f"🤖 Claude: {full_reply}")
+
+                logger.info(
+                    f"⏱️ Total LLM Latency: {time.time() - llm_start:.2f}s"
+                )
+
+                logger.info(
+                    f"🤖 Claude: {full_reply}"
+                )
+
+                items = parse_action_items_from_claude(full_reply)
+                logger.info(f"📌 parse_action_items result: {items}") 
+                if items:
+                    room_id = transport._signalling.room_id
+                    await save_action_items(room_id, items, transport._signalling)
+
+                # ─────────────────────────────────────────
+                # Save extracted action items into Postgres
+                # ─────────────────────────────────────────
+                # REPLACE with this:
+                # if "action item" in full_reply.lower():
+
+                #     items = []
+                #     current = {}
+
+                #     for line in full_reply.split("\n"):
+                #         line = line.strip().replace("**", "").replace("*", "")
+
+                #         if line.lower().startswith("task:"):
+                #             current["task"] = line.split(":", 1)[1].strip()
+                #         elif line.lower().startswith("owner:"):
+                #             current["owner"] = line.split(":", 1)[1].strip()
+                #         elif line.lower().startswith("due date:"):
+                #             current["due_date"] = line.split(":", 1)[1].strip()
+
+                #         if "owner" in current and "task" in current:
+                #             items.append({
+                #                 "owner": current.get("owner", "Unknown"),
+                #                 "task": current.get("task", ""),
+                #                 "due_date": current.get("due_date")
+                #             })
+                #             current = {}
+
+                #     logger.info(f"Items extracted: {items}")
+                #     logger.info(f"Extracted {len(items)} action items")
+
+                #     if items:
+                #         room_id = transport._signalling.room_id
+                #         logger.info(f"Saving action items for room: {room_id}")
+                #         await save_action_items(
+                #             room_id,
+                #             items,
+                #             transport._signalling
+                #         )
+                transcript_log.append({
+                    "speaker": "Samvyo",
+                    "text": full_reply,
+                    "confidence": 1.0,
+                    "ts": time.time()
+                })
+
                 break
 
             # execute requested tool(s) and send result back for final reply
+            # tool_results = []
+            # for tool_call in tool_calls:
+            #     logger.info(
+            #         f"TOOL CALLED: {tool_call.name}"
+            #     )
+
+            #     logger.info(
+            #         f"TOOL INPUT: {tool_call.input}"
+            #     )
+            #     if tool_call.name == "summarise_meeting":
+            #         summary_text = generate_meeting_summary()
+            #         tool_results.append({
+            #             "type": "tool_result",
+            #             "tool_use_id": tool_call.id,
+            #             "content": summary_text
+            #         })
+            #     elif tool_call.name == "extract_action_items":
+
+            #         logger.info(f"TOOL INPUT: {tool_call.input}")
+
+            #     transcript_text = build_action_item_context()
+
+            #     logger.info(
+            #         f"ACTION ITEM CONTEXT:\n{transcript_text}"
+            #     )
+
+            #     items = []
+
+            #     for line in transcript_text.split("\n"):
+
+            #         line = line.strip()
+
+            #         if "should" not in line.lower():
+            #             continue
+
+            #         try:
+
+            #             speaker_part, task_part = line.split(":", 1)
+
+            #             owner = task_part.split("should")[0].strip()
+
+            #             task = task_part.split("should", 1)[1].strip()
+
+            #             items.append({
+            #                 "owner": owner,
+            #                 "task": task,
+            #                 "due_date": None
+            #             })
+
+            #         except Exception as e:
+
+            #             logger.error(
+            #                 f"Action item extraction error: {e}"
+            #             )
+
+            #     logger.info(
+            #         f"DIRECTLY EXTRACTED ITEMS: {items}"
+            #     )
+
+            #     if items:
+
+            #         room_id = transport._signalling.room_id
+
+            #         logger.info(
+            #             f"Saving action items for room: {room_id}"
+            #         )
+
+            #         await save_action_items(
+            #             room_id,
+            #             items,
+            #             transport._signalling
+            #         )
+
+            #     tool_results.append({
+            #         "type": "tool_result",
+            #         "tool_use_id": tool_call.id,
+            #         "content": transcript_text
+            #     })
             tool_results = []
+
             for tool_call in tool_calls:
+                logger.info(f"TOOL CALLED: {tool_call.name}")
+
                 if tool_call.name == "summarise_meeting":
                     summary_text = generate_meeting_summary()
                     tool_results.append({
@@ -285,6 +474,14 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
                         "content": summary_text
                     })
 
+                elif tool_call.name == "extract_action_items":
+                    transcript_text = build_action_item_context()
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": transcript_text
+                    })
+            
             conversation_history.append({
                 "role": "user",
                 "content": tool_results
@@ -356,6 +553,20 @@ async def speak_sentence(text: str, transport: MediasoupTransport):
         if task in active_tts_tasks:
             active_tts_tasks.remove(task)
         logger.info("🎤 Listening again...")
+
+async def play_welcome_message(transport: MediasoupTransport):
+    """
+    Plays a welcome message once when the bot successfully joins the room.
+    Uses the same TTS pipeline as normal bot responses.
+    """
+
+    logger.info("👋 Playing welcome message")
+
+    await speak_sentence(
+        Config.WELCOME_MESSAGE,
+        transport
+    )
+
 async def tts_worker(transport: MediasoupTransport):
     """
     Single worker — pulls sentences off the queue and speaks them
@@ -445,6 +656,7 @@ async def run_bot():
 
     if Config.STT_BACKEND == "whisper":
         logger.info("🎙️ Using Whisper")
+        from .whisper_stt import WhisperSTT
         stt = WhisperSTT()
 
     else:
@@ -453,6 +665,7 @@ async def run_bot():
 
     if Config.TTS_PROVIDER == "cartesia":
         logger.info("🔊 Using Cartesia TTS")
+        from .tts.cartesia_tts import CartesiaTTS
         tts = CartesiaTTS()
         await tts.connect() 
 
@@ -463,11 +676,14 @@ async def run_bot():
 
     else:
         logger.info("🔊 Using Deepgram TTS")
+        from .tts.deepgram_tts import DeepgramTTS
         tts = DeepgramTTS()
 
     transport = MediasoupTransport()
     await transport.start()
     logger.info("✅ MediaSoup transport started")
+
+    await play_welcome_message(transport)
 
     asyncio.create_task(tts_worker(transport))
 
@@ -497,12 +713,31 @@ async def run_bot():
         if not text:
             return
         
-        logger.info(f"📝 Transcript: {text}")
+        logger.info(
+            f"📝 Transcript [{transport._signalling.current_speaker}]: {text}"
+        )
         logger.info(f"🎯 Confidence: {confidence:.2f}")
 
         if confidence < 0.70:
             logger.warning(f"❌ Transcript rejected (confidence={confidence:.2f})")
             return
+        # Store ALL participant speech for meeting summaries
+
+        transcript_event = {
+            "speaker": transport._signalling.current_speaker,
+            "text": text,
+            "confidence": confidence,
+            "ts": time.time()
+        }
+
+        transcript_log.append(transcript_event)
+        logger.info(
+            f"TRANSCRIPT LOG SIZE: {len(transcript_log)}"
+        )
+
+        logger.info(
+            f"LAST ENTRY: {transcript_log[-1]}"
+        )
 
         # ── INTERRUPT HANDLING (any speech while bot is talking) ───
         global is_speaking, active_tts_tasks
@@ -538,13 +773,13 @@ async def run_bot():
 
         logger.info(f"❓ Question for Claude: '{question}'")
 
-        transcript_event = {
-            "speaker": transport._signalling.current_speaker,
-            "text": text,
-            "confidence": confidence,
-            "ts": time.time()
-        }
-        transcript_log.append(transcript_event)
+        # transcript_event = {
+        #     "speaker": transport._signalling.current_speaker,
+        #     "text": text,
+        #     "confidence": confidence,
+        #     "ts": time.time()
+        # }
+        # transcript_log.append(transcript_event)
 
         await transport._signalling.send_transcript(
             speaker=transcript_event["speaker"],

@@ -36,6 +36,8 @@ function App() {
   const [joined, setJoined] = useState(false);
   const [myPeerId, setMyPeerId] = useState("");
 
+  const [botActive, setBotActive] = useState(false);
+  
   useEffect(() => {
   const savedToken    = sessionStorage.getItem("token");
   const savedUsername = sessionStorage.getItem("username");
@@ -104,7 +106,15 @@ function App() {
 
 
     room.onLocalScreenStream = (stream) => setLocalScreenStream(stream || null);
-    room.onMessage = () => {};
+
+    room.onMessage = (msg) => {
+      console.log("APP RECEIVED:", msg);
+
+      if (msg.type === "bot-ready") {
+        console.log("🤖 BOT READY RECEIVED");
+        setBotActive(true);
+      }
+    };
     room.onChat = (msg) => setChat(prev => [...prev, msg]);
 
 
@@ -390,6 +400,29 @@ function App() {
               {u !== myPeerId && <span id={`quality-user-${u}`} style={{ marginLeft:4, color:"#555", fontSize:10 }}>⚪ --ms</span>}
             </span>
           ))}
+        </div>
+      )}
+
+      {/* AI CONSENT BANNER */}
+      {botActive && (
+        <div
+          style={{
+            display: "flex",
+            gap: "12px",
+            alignItems: "center",
+            padding: "6px 16px",
+            background: "rgba(124,106,247,0.12)",
+            borderBottom: "1px solid #2a2a35",
+            fontSize: "12px"
+          }}
+        >
+          <span>🤖 AI Assistant Active</span>
+
+          {isRecording && (
+            <span style={{ color: "#e74c3c" }}>
+              🔴 Recording Active
+            </span>
+          )}
         </div>
       )}
 

@@ -84,7 +84,7 @@ class CartesiaTTS:
         response = await self._ws.send(
             model_id=model_id,
             transcript=text,
-            voice={"id": Config.CARTESIA_VOICE_ID},
+            voice_id=Config.CARTESIA_VOICE_ID,
             language="en",
             output_format={
                 "container": "raw",
@@ -97,5 +97,6 @@ class CartesiaTTS:
             if first_chunk:
                 # logger.info(f"🚀 First chunk in {(time.time() - start) * 1000:.0f}ms")
                 first_chunk = False
-            if chunk.audio:
-                yield chunk.audio
+            audio = chunk.get("audio")
+            if audio:
+                yield audio

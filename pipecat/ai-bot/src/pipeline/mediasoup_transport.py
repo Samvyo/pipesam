@@ -86,7 +86,7 @@ class MediasoupTransport(BaseTransport):
 
     async def start(self):
         # Step 1 — bind RTP receiver
-        self._receiver = RTPReceiver(host="127.0.0.1", port=55000)
+        self._receiver = RTPReceiver(host="127.0.0.1", port=0)
         actual_port = self._receiver.start()
         logger.info(f"🎧 RTP receiver bound on port {actual_port}")
 

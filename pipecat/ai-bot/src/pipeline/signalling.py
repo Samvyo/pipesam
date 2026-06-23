@@ -19,6 +19,8 @@ class BotSignalling:
         self.ssrc_to_peer = {}
         self.current_speaker = "unknown"
 
+        self.room_id = None
+
         # bot.py waits on this before reading RTP packets
         self.ready = asyncio.Event()
 
@@ -38,6 +40,10 @@ class BotSignalling:
 
     # Configure MediaSoup consumer transport and start receiving browser audio via RTP.
     async def setup(self, room_id: str):
+
+        self.room_id = room_id
+
+        await self._send({'type': 'join-room'})
 
         # RPC 1: Join the room so the server can register the bot as a room participant
         await self._send({'type': 'join-room'})
@@ -289,7 +295,11 @@ class BotSignalling:
             "confidence": confidence,
             "ts": ts
         })
-
+    async def send_action_items(self, items):
+        await self._send({
+            "type": "action-items",
+            "items": items
+        })
     
     # Close RTP sender and WebSocket connection during shutdown.  
     async def close(self):

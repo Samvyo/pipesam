@@ -12,13 +12,21 @@ services:
   signaling:
     build: ./server
     network_mode: "host"
+    # command: node server/server.js
+
+    env_file:
+      - ./ai-bot/.env
+
     volumes:
       - ./certs:/certs
       - ./recordings:/app/recordings
+      - /home/vidya/pipesam/pipecat/ai-bot:/ai-bot
     environment:
       - ANNOUNCED_IP=192.168.29.128
       - REDIS_HOST=127.0.0.1
       - REDIS_PORT=6379
+      # - POETRY_VIRTUALENVS_IN_PROJECT=false
+      # - POETRY_VIRTUALENVS_PATH=/ai-bot-venvs
     depends_on:
       - redis
 
@@ -46,6 +54,19 @@ services:
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
+  
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: samvyo
+      POSTGRES_USER: samvyo
+      POSTGRES_PASSWORD: samvyo123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 
   # ── NEW: Prometheus ──────────────────────────────────────────
   prometheus:
@@ -73,4 +94,5 @@ services:
 volumes:
   redis_data:
   prometheus_data:   
-  grafana_data:     
+  postgres_data:
+  grafana_data:    

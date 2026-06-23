@@ -108,6 +108,16 @@ export default class Room {
     this.ws.onmessage = async (event) => {
       const data = JSON.parse(event.data);
 
+      console.log("WS MESSAGE:", data.type);
+
+      if (data.type === "bot-ready") {
+        console.log("🤖 BOT READY RECEIVED");
+
+        this.onMessage?.(data);
+
+        return;
+      }
+
       if (data.type === 'server-shutdown') {
 
         if (this._serverShutdown) return;
