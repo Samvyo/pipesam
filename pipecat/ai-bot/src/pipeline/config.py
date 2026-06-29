@@ -23,6 +23,45 @@ class Config:
     # Rate limiting — seconds between LLM calls per user
     LLM_RATE_LIMIT_SECONDS: float = float(os.getenv("LLM_RATE_LIMIT_SECONDS", "2.0")) 
 
+    VISION_PROVIDER = os.getenv(
+        "VISION_PROVIDER",
+        "sonnet"
+    )
+
+    SONNET_VISION_MODEL = os.getenv(
+        "SONNET_VISION_MODEL",
+        "claude-sonnet-4-5-20250929"
+    )
+
+    VISION_MODEL = os.getenv(
+        "VISION_MODEL",
+        "claude-haiku-4-5-20251001"
+    )
+
+    LLAVA_MODEL = os.getenv(
+        "LLAVA_MODEL",
+        "llava"
+    )
+
+    LLAVA_URL = os.getenv(
+        "LLAVA_URL",
+        "http://host.docker.internal:11434/api/generate"
+    )
+
+    VISION_TIMEOUT = float(
+        os.getenv(
+            "VISION_TIMEOUT",
+            "60"
+        )
+    )
+
+    VISION_MIN_INTERVAL = float(
+        os.getenv(
+            "VISION_MIN_INTERVAL",
+            "5"
+        )
+    )
+
 
     # ── Wake Word & Meeting Context ──────────────────────────────────────────
     # Wake word

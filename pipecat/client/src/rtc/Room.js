@@ -48,6 +48,7 @@ export default class Room {
     this._serverShutdown = false;
 
     this.onTranscript = null;
+    this.onSlideSummary = null;
   }
 
   setStatus(val) {
@@ -357,6 +358,11 @@ export default class Room {
         this.renderMessages(data.payload.messages);
         if (this.peers.size < 2) this.addMsg("Waiting for another user...");
 
+        // ADD THIS ONE LINE ↓
+        if (data.payload.botActive) {
+          this.onMessage?.({ type: 'bot-ready' });
+        }
+
         // set defaults for all peers first
         for (const pid of this.peers) {
           if (pid !== this.peerId) {
@@ -486,6 +492,14 @@ export default class Room {
         );
 
         this.onTranscript?.(data);
+
+      }
+
+      if (data.type === "slide-summary") {
+
+        console.log("📄 Slide Summary:", data.summary);
+
+        this.onSlideSummary?.(data.summary);
 
       }
       // ✅ Server created transport — set up client side
@@ -761,6 +775,16 @@ export default class Room {
     });
   }
 
+  setVideoAIConsent(consent) {
+    this.videoAIConsent = consent;
+
+    this._send({
+      type: "video-ai-consent",
+      consent
+    });
+  }
+
+
   async toggleScreenShare() {
     try {
       if (!this.screenTrack) {
@@ -911,6 +935,7 @@ export default class Room {
     this.peerStates = {};
     this.screenSharers = {};
     this.dataConsumers = new Map();
+    this.videoAIConsent = false;
   }
   // ✅ MEDIASOUP: Load device with server capabilities
   async loadDevice(routerRtpCapabilities) {

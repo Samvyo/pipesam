@@ -9,6 +9,7 @@ from .rtp_receiver import RTPReceiver
 from .rtp_sender import RTPSender
 from .signalling import BotSignalling
 from .config import Config
+# from .video_rtp_receiver import VideoRTPReceiver
 
 
 class MediasoupInputTransport(FrameProcessor):
@@ -71,13 +72,30 @@ class MediasoupOutputTransport(FrameProcessor):
 
 class MediasoupTransport(BaseTransport):
 
-    def __init__(self):
+    def __init__(self,vision=None):
         super().__init__()
+        self._vision = vision
         self._receiver: RTPReceiver | None = None
         self._sender: RTPSender | None = None
         self._signalling: BotSignalling | None = None
         self._input_processor: MediasoupInputTransport | None = None
         self._output_processor: MediasoupOutputTransport | None = None
+    #     self._video_receiver: VideoRTPReceiver | None = None
+
+    # async def _video_debug_loop(self):
+    #     while True:
+    #         try:
+    #             packet = await self._video_receiver.read_packet()
+
+    #             logger.info(
+    #                 f"🖥 VIDEO RTP PACKET size={len(packet)}"
+    #             )
+
+    #         except Exception as e:
+    #             logger.error(
+    #                 f"Video RTP error: {e}"
+    #             )
+
     def input(self) -> FrameProcessor:
         return self._input_processor
 
@@ -86,7 +104,7 @@ class MediasoupTransport(BaseTransport):
 
     async def start(self):
         # Step 1 — bind RTP receiver
-        self._receiver = RTPReceiver(host="127.0.0.1", port=0)
+        self._receiver = RTPReceiver(host="127.0.0.1", port=0, vision=self._vision)
         actual_port = self._receiver.start()
         logger.info(f"🎧 RTP receiver bound on port {actual_port}")
 
@@ -94,8 +112,10 @@ class MediasoupTransport(BaseTransport):
         self._signalling = BotSignalling(
             server_url=Config.SIGNALLING_URL,
             token=Config.BOT_TOKEN,
-            rtp_port=actual_port
+            rtp_port=actual_port,
         )
+
+        self._signalling._vision = self._vision
 
         self._receiver._signalling = self._signalling 
         

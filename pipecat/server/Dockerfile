@@ -32,6 +32,7 @@ RUN pip install --retries 10 --timeout 120 \
     numpy \
     scipy \
     soundfile \
+    pillow \
     pydub \
     loguru \
     python-dotenv \
@@ -44,11 +45,13 @@ RUN pip install --retries 10 --timeout 120 \
     opuslib \
     cartesia \
     kokoro \
+    av \
     "deepgram-sdk>=3.0.0,<4.0.0" \
     "pipecat-ai[deepgram,anthropic,silero,cartesia]==0.0.47"
 
 # Fail at build time if torch missing — not at runtime
 RUN python3 -c "import torch; print('✅ torch', torch.__version__)"
+RUN python3 -c "from PIL import Image; print('✅ Pillow installed')"
 RUN python3 -c "import torch"
 RUN python3 -c "import torchaudio"
 RUN python3 -c "import anthropic"
@@ -57,6 +60,7 @@ RUN python3 -c "import deepgram"
 RUN python3 -c "import numpy"
 RUN python3 -c "import websockets"
 RUN python3 -c "from kokoro import KPipeline"
+RUN python3 -c "import av; print('✅ av', av.__version__)"
 
 # Node app
 WORKDIR /app

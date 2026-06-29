@@ -139,6 +139,7 @@ class Room {
 
     this.transcripts = [];
     this.actionItems = [];
+    this.videoAIConsent = {};
   }
 
   addPeer(peerId, ws) {
@@ -934,6 +935,30 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    if (data.type === "video-ai-consent") {
+      const room = roomManager.get(ws.roomId);
+      if (!room) return;
+
+      room.videoAIConsent[ws.peerId] = data.consent;
+
+      console.log(
+        `🤖 AI Consent: ${ws.peerId} -> ${data.consent}`
+      );
+
+      // Forward consent update to bot
+      const botSocket = room.peers.get("bot");
+
+      if (botSocket && botSocket.readyState === WebSocket.OPEN) {
+        botSocket.send(JSON.stringify({
+          type: "video-ai-consent",
+          peerId: ws.peerId,
+          consent: data.consent
+        }));
+      }
+
+      return;
+    }
+
     const botTypes = new Set([
       'create-bot-transport',
       'connect-bot-transport',
@@ -1145,11 +1170,19 @@ if (data.type === 'rtp-capabilities') {
         type: 'state-sync',
         payload: {
           peers: room.listPeers(),
-          messages: redisMessages,  
+          messages: redisMessages,
           muteStates: fullStates,
-          screenSharers: Object.keys(room.screenSharers || {})
+          screenSharers: Object.keys(room.screenSharers || {}),
+          botActive: botProcesses.has(roomId)
         }
       }));
+
+      // If bot is already running, inform the newly joined peer
+      if (botProcesses.has(roomId) && peerId !== "bot") {
+        ws.send(JSON.stringify({
+          type: "bot-ready"
+        }));
+      }
 
       if (!isRecovering) {
         room.broadcast(
@@ -1288,6 +1321,11 @@ if (data.type === 'rtp-capabilities') {
 
       console.log(`✅ Producer created [${ws.peerId}] kind=${producer.kind} id=${producer.id}`);
 
+      console.log(
+        "APP DATA:",
+        producer.appData
+      );
+
     // Store producer on the room so other peers can consume it later (Day 8 next steps)
       if (!room.producers) room.producers = new Map();
       room.producers.set(producer.id, {
@@ -1316,6 +1354,30 @@ if (data.type === 'rtp-capabilities') {
             `📢 Sent producer ${producer.id} (${ws.peerId}) to bot`
           );
 
+        }
+      }
+
+      if (
+        producer.kind === 'video' &&
+        producer.appData?.type === 'screen'
+      ) {
+
+        const botSocket = room.peers.get('bot');
+
+        if (
+          botSocket &&
+          botSocket.readyState === WebSocket.OPEN
+        ) {
+
+          botSocket.send(JSON.stringify({
+            type: 'new-video-producer',
+            producerId: producer.id,
+            peerId: ws.peerId
+          }));
+
+          console.log(
+            `🖥 Sent video producer ${producer.id} (${ws.peerId}) to bot`
+          );
         }
       }
 
@@ -1529,6 +1591,27 @@ if (data.type === 'rtp-capabilities') {
       room.actionItems = data.items || [];
 
       console.log(`📌 Stored ${room.actionItems.length} action items for room ${ws.roomId}:`, room.actionItems);
+    }
+
+    else if (data.type === "slide-summary") {
+
+      const room = roomManager.get(ws.roomId);
+
+      if (!room) return;
+
+      room.peers.forEach((client) => {
+
+        if (client.readyState === WebSocket.OPEN) {
+
+          client.send(JSON.stringify({
+            type: "slide-summary",
+            summary: data.summary,
+          }));
+
+        }
+
+      });
+
     }
 
     else if (data.type === 'transcript') {
@@ -2015,7 +2098,25 @@ else if (data.type === 'stop-recording') {
       client.send(JSON.stringify({ type: 'recording-stopped' }));
     }
   });
-}   
+}  
+
+else if (data.type === 'request-keyframe') {
+  const room = roomManager.get(ws.roomId);
+  if (!room) return;
+
+  for (const [, entry] of room.botTransports) {
+    for (const [consumerId, consumer] of entry.consumers) {
+      if (consumer.kind === 'video') {
+        try {
+          await consumer.requestKeyFrame();
+          console.log(`🔑 PLI sent for video consumer ${consumerId}`);
+        } catch (e) {
+          console.warn('requestKeyFrame failed:', e.message);
+        }
+      }
+    }
+  }
+}
   });
 
 

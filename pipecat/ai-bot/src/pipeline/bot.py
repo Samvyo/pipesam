@@ -13,6 +13,7 @@ from .config import Config
 from .deepgram_stt import DeepgramSTT
 # from .whisper_stt import WhisperSTT
 from .mediasoup_transport import MediasoupTransport
+from .vision_analyzer import VisionAnalyser
 
 # from .tts.cartesia_tts import CartesiaTTS
 # from .tts.deepgram_tts import DeepgramTTS
@@ -62,6 +63,7 @@ tts = None
 last_llm_token_time = None
 
 first_audio_measured= False
+vision = VisionAnalyser()
 
 
 def load_silero_vad():
@@ -640,12 +642,51 @@ async def comfort_noise_worker(transport):
                 f"Comfort noise error: {e}"
             )
 
+async def periodic_slide_summary(vision,
+    transport,):
+
+    while True:
+
+        await asyncio.sleep(60)
+
+        if not vision.screen_share_active:
+            continue
+
+
+        screen_peer = vision.current_screen_sharer
+
+        if not transport._signalling.video_ai_consent.get(screen_peer, False):
+            continue
+
+        jpeg = vision.get_latest_frame()
+
+        if jpeg is None:
+            continue
+
+        logger.info("📄 Generating periodic slide summary")
+
+        try:
+
+            summary = await vision.summarise_slide(jpeg)
+
+            await transport._signalling.send_slide_summary(summary)
+
+            # TODO:
+            # send through data channel
+
+        except Exception as e:
+
+            logger.error(
+                f"Periodic summary failed: {e}"
+            )
+
 async def run_bot():
     global is_speaking
     global pipeline_start_time
     global room_participants
     global current_tts_task
     global tts
+    
 
     Config.validate()
     logger.info("🚀 Starting pipeline...")
@@ -679,8 +720,14 @@ async def run_bot():
         from .tts.deepgram_tts import DeepgramTTS
         tts = DeepgramTTS()
 
-    transport = MediasoupTransport()
+    transport = MediasoupTransport(vision=vision)
     await transport.start()
+    asyncio.create_task(
+        periodic_slide_summary(
+            vision,
+            transport,
+        )
+    )
     logger.info("✅ MediaSoup transport started")
 
     await play_welcome_message(transport)
@@ -711,6 +758,14 @@ async def run_bot():
         global pipeline_start_time, current_tts_task
 
         if not text:
+            return
+        
+        # ── MUTE CHECK ──────────────────────────────
+        speaker     = transport._signalling.current_speaker
+        mute_states = transport._signalling.mute_states
+
+        if mute_states.get(speaker, False):
+            logger.info(f"🔇 Skipping — {speaker} is muted")
             return
         
         logger.info(
@@ -773,13 +828,129 @@ async def run_bot():
 
         logger.info(f"❓ Question for Claude: '{question}'")
 
-        # transcript_event = {
-        #     "speaker": transport._signalling.current_speaker,
-        #     "text": text,
-        #     "confidence": confidence,
-        #     "ts": time.time()
-        # }
-        # transcript_log.append(transcript_event)
+        # Screen analysis command
+        question_lower = question.lower()
+
+        if any(
+            keyword in question_lower
+            for keyword in [
+                "screen",
+                "slide",
+                "presentation",
+                "share",
+                "shared"
+            ]
+        ):
+
+            logger.info(
+                "👁 Screen analysis requested"
+            )
+
+            jpeg = vision.get_latest_frame()
+
+            logger.info(
+                f"JPEG available = {jpeg is not None}"
+            )
+
+            if jpeg is None:
+
+                await speak_sentence(
+                    "No screen share is available.",
+                    transport
+                )
+
+                return
+
+            try:
+                screen_peer = vision.current_screen_sharer
+
+                if not transport._signalling.video_ai_consent.get(screen_peer, False):
+                    await speak_sentence(
+                        "The participant has not enabled AI consent.",
+                        transport,
+                    )
+                    return
+
+                logger.info(f"👁 Running Vision ({Config.VISION_PROVIDER.upper()})")
+
+                description = await vision.describe_screen(jpeg)
+
+                logger.info(f"📥 Vision Result ({vision.last_provider.upper()}): {description}")
+
+                await speak_sentence(
+                    description,
+                    transport
+                )
+
+            except Exception as e:
+
+                logger.error(
+                    f"Vision error: {e}"
+                )
+
+                await speak_sentence(
+                    "I couldn't analyse the screen.",
+                    transport
+                )
+
+            return
+        
+        # Slide summarization command
+
+        if (
+            "summarize" in question_lower
+            or "summary" in question_lower
+        ) and (
+            "slide" in question_lower
+            or "presentation" in question_lower
+        ):
+
+            logger.info("📄 Slide summarization requested")
+
+            jpeg = vision.get_latest_frame()
+
+
+            if jpeg is None:
+
+                await speak_sentence(
+                    "No presentation is being shared.",
+                    transport
+                )
+
+                return
+
+            try:
+
+                screen_peer = vision.current_screen_sharer
+
+                if not transport._signalling.video_ai_consent.get(screen_peer, False):
+                    await speak_sentence(
+                        "The participant has not enabled AI consent.",
+                        transport,
+                    )
+                    return
+
+                summary = await vision.summarise_slide(jpeg)
+
+                logger.info(f"📄 Slide Summary: {summary}")
+
+                await speak_sentence(
+                    summary,
+                    transport
+                )
+
+            except Exception as e:
+
+                logger.error(
+                    f"Slide summary error: {e}"
+                )
+
+                await speak_sentence(
+                    "I couldn't summarize the slide.",
+                    transport
+                )
+
+            return
 
         await transport._signalling.send_transcript(
             speaker=transcript_event["speaker"],

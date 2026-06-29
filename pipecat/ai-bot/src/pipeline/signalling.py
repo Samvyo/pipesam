@@ -10,14 +10,20 @@ class BotSignalling:
         self.server_url = server_url
         self.token      = token
         self.rtp_port   = rtp_port
+        # self.video_rtp_port = video_rtp_port
         
         self.ws         = None
         self.transport_id  = None
         self.consumer_id   = None
         self.sender        = None
 
+        self.video_ai_consent = {}
+        self.latest_video_producer = {}
+        self.active_video_consumers = set()
+
         self.ssrc_to_peer = {}
         self.current_speaker = "unknown"
+        self.mute_states = {}
 
         self.room_id = None
 
@@ -195,6 +201,56 @@ class BotSignalling:
             )
 
             self.ready.set()
+
+    async def create_video_consumer(
+        self,
+        producer_id
+    ):
+        if producer_id in self.active_video_consumers:
+            logger.info(
+                f"Video consumer already exists for {producer_id}"
+            )
+            return
+        
+        async with self.consumer_lock:
+
+            await self._send({
+                'type': 'create-bot-consumer',
+                'transportId': self.transport_id,
+                'producerId': producer_id,
+            })
+
+            response = await self._wait_for(
+                'bot-consumer-created'
+            )
+
+            logger.info(
+                f"🖥 VIDEO CONSUMER CREATED: "
+                f"{response.get('kind')}"
+            )
+
+            logger.info(
+                f"🖥 VIDEO RTP PARAMS: "
+                f"{response.get('rtpParameters')}"
+            )
+
+            await self._send({
+                'type': 'resume-bot-consumer',
+                'transportId': self.transport_id,
+            })
+
+            await self._wait_for(
+                'bot-consumer-resumed'
+            )
+
+            logger.info(
+                "🖥 Video consumer resumed"
+            )
+            self.active_video_consumers.add(producer_id)
+            # Request keyframe — bot joined after stream started
+            await asyncio.sleep(0.3)
+            await self.request_keyframe()
+
     # Continuously listen for signalling messages from the server.
     # async def listen(self):
     #     try:
@@ -218,6 +274,11 @@ class BotSignalling:
 
     #     except Exception as e:
     #         logger.warning(f"[signalling] connection closed: {e}")
+
+    async def request_keyframe(self):
+        """Send PLI to browser — forces it to send a VP8 keyframe immediately."""
+        await self._send({'type': 'request-keyframe'})
+        logger.info("📡 PLI requested — browser will send keyframe")
 
     async def listen(self):
         try:
@@ -247,7 +308,93 @@ class BotSignalling:
                     asyncio.create_task(
                         self.create_consumer(msg['producerId'])
                     )
+                elif msg_type == "new-video-producer":
+                    logger.info(
+                        f"🖥 Screen share detected from {msg['peerId']}"
+                    )
 
+                    if hasattr(self, "_vision") and self._vision:
+                        self._vision.screen_share_active = True
+                        self._vision.current_screen_sharer = msg["peerId"]
+                    
+                    self.latest_video_producer[msg["peerId"]] = msg["producerId"]
+
+                    if self.video_ai_consent.get(msg["peerId"], False):
+                        logger.info(
+                            f"✅ AI consent enabled for {msg['peerId']} - creating video consumer"
+                        )
+
+                        asyncio.create_task(
+                            self.create_video_consumer(
+                                msg["producerId"]
+                            )
+                        )
+
+                    else:
+                        logger.info(
+                            f"⛔ AI consent not enabled for {msg['peerId']} - skipping video consumer"
+                        )
+
+                elif msg_type == "video-ai-consent":
+
+                    peer_id = msg["peerId"]
+                    consent = msg["consent"]
+
+                    self.video_ai_consent[peer_id] = consent
+
+                    logger.info(
+                        f"🤖 AI Consent: {peer_id} -> {consent}"
+                    )
+
+                    if consent:
+
+                        producer_id = self.latest_video_producer.get(peer_id)
+
+                        if producer_id:
+
+                            logger.info(
+                                f"Creating video consumer after consent for {peer_id}"
+                            )
+
+                            asyncio.create_task(
+                                self.create_video_consumer(
+                                    producer_id
+                                )
+                            )
+
+                    else:
+
+                        logger.info(
+                            f"AI consent disabled for {peer_id}"
+                        )
+
+                        self.latest_video_producer.pop(peer_id, None)
+
+                elif msg_type == "mute-status":
+                    peer_id = msg.get("from")
+                    muted   = msg.get("muted", False)
+                    self.mute_states[peer_id] = muted
+                    logger.info(f"🔇 Mute state: {peer_id} → {'muted' if muted else 'unmuted'}")
+
+                
+                elif msg_type == "screen-share-stop":
+
+                    logger.info("🛑 Screen share stopped")
+
+                    peer_id = msg.get("from")
+
+                    producer_id = None
+
+                    if peer_id:
+                        producer_id = self.latest_video_producer.pop(peer_id, None)
+
+                    if producer_id:
+                        self.active_video_consumers.discard(producer_id)
+
+                    if hasattr(self, "_vision") and self._vision:
+                        self._vision.screen_share_active = False
+                        self._vision.current_screen_sharer = None
+                
         except Exception as e:
             logger.warning(f"[signalling] connection closed: {e}")
 
@@ -299,6 +446,11 @@ class BotSignalling:
         await self._send({
             "type": "action-items",
             "items": items
+        })
+    async def send_slide_summary(self, summary):
+        await self._send({
+            "type": "slide-summary",
+            "summary": summary,
         })
     
     # Close RTP sender and WebSocket connection during shutdown.  

@@ -30,6 +30,8 @@ function App() {
   const [users, setUsers] = useState([]);
   const [peerState, setPeerState] = useState({});
 
+  const [slideSummaries, setSlideSummaries] = useState([]);
+
   const [captions, setCaptions] = useState({});
 
   const [token, setToken] = useState("");
@@ -37,6 +39,7 @@ function App() {
   const [myPeerId, setMyPeerId] = useState("");
 
   const [botActive, setBotActive] = useState(false);
+  const [videoAIConsent, setVideoAIConsent] = useState(false);
   
   useEffect(() => {
   const savedToken    = sessionStorage.getItem("token");
@@ -113,6 +116,7 @@ function App() {
       if (msg.type === "bot-ready") {
         console.log("🤖 BOT READY RECEIVED");
         setBotActive(true);
+        console.log("botActive set to true");
       }
     };
     room.onChat = (msg) => setChat(prev => [...prev, msg]);
@@ -131,6 +135,13 @@ function App() {
         [data.speaker]: data.text
       }));
 
+    };
+
+    room.onSlideSummary = (summary) => {
+      setSlideSummaries(prev => [
+        ...prev,
+        `📄 AI: ${summary}`
+      ]);
     };
 
     room.onPeersUpdate = (list) => {
@@ -403,6 +414,11 @@ function App() {
         </div>
       )}
 
+      {console.log("Render:", {
+        botActive,
+        videoAIConsent
+      })}
+
       {/* AI CONSENT BANNER */}
       {botActive && (
         <div
@@ -417,6 +433,28 @@ function App() {
           }}
         >
           <span>🤖 AI Assistant Active</span>
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              marginLeft: "12px"
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={videoAIConsent}
+              onChange={(e) => {
+                const consent = e.target.checked;
+                console.log("Consent changed:", consent);
+                setVideoAIConsent(consent);
+
+                room.setVideoAIConsent(consent);
+              }}
+            />
+
+            Allow AI to analyze my shared screen
+          </label>
 
           {isRecording && (
             <span style={{ color: "#e74c3c" }}>
@@ -587,8 +625,16 @@ function App() {
         <button style={S.btn(myState.videoOff?"#c0392b":undefined)} onClick={() => room.toggleVideo()}>
           {myState.videoOff ? "📷 Cam On" : "📷 Cam Off"}
         </button>
-        <button style={S.btn(myState.isScreenSharing?"#e67e22":undefined)} onClick={() => room.toggleScreenShare()}>
+        {/* <button style={S.btn(myState.isScreenSharing?"#e67e22":undefined)} onClick={() => room.toggleScreenShare()}>
           {myState.isScreenSharing ? "🛑 Stop Share" : "🖥 Share"}
+        </button> */}
+        <button
+          style={S.btn(myState.isScreenSharing ? "#e67e22" : undefined)}
+          onClick={() => room.toggleScreenShare()}
+        >
+          {myState.isScreenSharing
+            ? "🛑 Stop Share"
+            : "🖥 Share"}
         </button>
 
       {isMyRecording ? (
@@ -619,7 +665,22 @@ function App() {
   
       {/* CHAT LOG */}
       <div style={S.chatLog}>
-        {chat.map((c, i) => <div key={i} style={{ color:"#888", padding:"1px 0" }}>{c}</div>)}
+        {chat.map((c, i) => (
+          <div key={`chat-${i}`}>{c}</div>
+        ))}
+
+        {slideSummaries.map((s, i) => (
+          <div
+            key={`summary-${i}`}
+            style={{
+              color: "#7c6af7",
+              marginTop: 6,
+              fontWeight: "bold"
+            }}
+          >
+            {s}
+          </div>
+        ))}
       </div>
 
       {/* STATS PANEL */}
