@@ -11,9 +11,15 @@ from loguru import logger
 import os
 from .config import Config
 from .deepgram_stt import DeepgramSTT
+from opentelemetry import context
+
 # from .whisper_stt import WhisperSTT
 from .mediasoup_transport import MediasoupTransport
 from .vision_analyzer import VisionAnalyser
+from .pii_scrubber import PIIScrubber
+from .tracing import init_tracing, get_tracer
+from .circuit_breaker import CircuitBreaker
+from .cost_tracker import CostTracker
 
 # from .tts.cartesia_tts import CartesiaTTS
 # from .tts.deepgram_tts import DeepgramTTS
@@ -64,6 +70,9 @@ last_llm_token_time = None
 
 first_audio_measured= False
 vision = VisionAnalyser()
+pii_scrubber = PIIScrubber()
+llm_circuit_breaker = CircuitBreaker()
+cost_tracker = CostTracker()
 
 
 def load_silero_vad():
@@ -96,9 +105,11 @@ def contains_wake_word(text: str) -> bool:
     Removes punctuation before checking so
     'Hey, bot' matches wake word 'hey bot'.
     """
-    cleaned = re.sub(r'[^\w\s]', '', text.lower().strip())
-    wake    = re.sub(r'[^\w\s]', '', Config.WAKE_WORD.lower().strip())
-    
+    cleaned = re.sub(r'[^\w\s]', ' ', text.lower())
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    wake    = re.sub(r'[^\w\s]', ' ', Config.WAKE_WORD.lower().strip())
+    wake    = re.sub(r'\s+', ' ', wake).strip()
+
     result = wake in cleaned
     logger.info(f"🔍 Wake word check: '{wake}' in '{cleaned}' → {result}")
     return result
@@ -224,6 +235,7 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
     global current_tts_task
     global last_llm_token_time
     global first_audio_measured
+    tracer = get_tracer()
 
     first_audio_measured = False
 
@@ -234,6 +246,18 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
     trim_conversation_history()
 
     logger.info(f"🧠 Asking Claude (streaming): {user_text}")
+
+    if not llm_circuit_breaker.allow_request():
+
+        logger.warning(
+            "🔴 Circuit OPEN - Using fallback response"
+        )
+
+        tts_queue.put_nowait(
+            "The AI assistant is temporarily unavailable. Please try again shortly."
+        )
+
+        return
 
     client = anthropic.Anthropic(api_key=Config.ANTHROPIC_API_KEY)
 
@@ -253,54 +277,78 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
         first_token_logged = False
 
         try:
-            logger.info(
-                f"Transcript count before Claude call: {len(transcript_log)}"
-            )
-            with client.messages.stream(
-                model=Config.LLM_MODEL,
-                max_tokens=Config.LLM_MAX_TOKENS,
-                system=system_prompt,
-                tools=[summarise_tool,extract_action_items_tool],
-                messages=conversation_history
-            ) as stream:
 
-                for event in stream:
-                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
-                        if not first_token_logged:
-                            first_token_logged = True
-                            first_token_time = time.time()
-                            logger.info(f"⚡ First token latency: {time.time() - llm_start:.2f}s")
+            with tracer.start_as_current_span("llm.claude") as span:
 
-                        text_chunk = event.delta.text
-                        last_llm_token_time = time.time()
+                span.set_attribute(
+                    "model",
+                    Config.LLM_MODEL
+                )
 
-                        full_reply += text_chunk
-                        sentence_buffer += text_chunk
+                span.set_attribute(
+                    "prompt.length",
+                    len(user_text)
+                )
 
-                        phrase_endings = re.compile(r'[.!?;:]')
+                span.set_attribute(
+                    "meeting.participants",
+                    len(room_participants)
+                )
 
-                        if phrase_endings.search(sentence_buffer):
+                logger.info(
+                    f"Transcript count before Claude call: {len(transcript_log)}"
+                )
+                with client.messages.stream(
+                    model=Config.LLM_MODEL,
+                    max_tokens=Config.LLM_MAX_TOKENS,
+                    system=system_prompt,
+                    tools=[summarise_tool,extract_action_items_tool],
+                    messages=conversation_history
+                ) as stream:
 
-                            parts = re.split(r'([.!?;:])', sentence_buffer)
+                    for event in stream:
+                        if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                            if not first_token_logged:
+                                first_token_logged = True
+                                first_token_time = time.time()
+                                logger.info(f"⚡ First token latency: {time.time() - llm_start:.2f}s")
 
-                            while len(parts) >= 2:
+                            text_chunk = event.delta.text
+                            last_llm_token_time = time.time()
 
-                                phrase = (parts[0] + parts[1]).strip()
+                            full_reply += text_chunk
+                            sentence_buffer += text_chunk
 
-                                if phrase:
-                                    tts_send_time = time.time()
+                            phrase_endings = re.compile(r'[.!?;:]')
 
-                                    logger.info(
-                                        f"🔊 Queuing TTS chunk: {phrase} | "
-                                        f"⚡ first-token→TTS-queue latency: "
-                                        f"{(tts_send_time - first_token_time)*1000:.0f}ms"
-                                    )
+                            if phrase_endings.search(sentence_buffer):
 
-                                    tts_queue.put_nowait(phrase)
+                                parts = re.split(r'([.!?;:])', sentence_buffer)
 
-                                parts = parts[2:]
+                                while len(parts) >= 2:
 
-                            sentence_buffer = "".join(parts)
+                                    phrase = (parts[0] + parts[1]).strip()
+
+                                    if phrase:
+                                        tts_send_time = time.time()
+
+                                        logger.info(
+                                            f"🔊 Queuing TTS chunk: {phrase} | "
+                                            f"⚡ first-token→TTS-queue latency: "
+                                            f"{(tts_send_time - first_token_time)*1000:.0f}ms"
+                                        )
+
+                                    
+                                        tts_queue.put_nowait(
+                                            (
+                                                phrase,
+                                                context.get_current()
+                                            )
+                                        )
+
+                                    parts = parts[2:]
+
+                                sentence_buffer = "".join(parts)
 
                     if event.type == "content_block_stop":
                         block = getattr(event, "content_block", None)
@@ -312,6 +360,32 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
 
                 final_message = stream.get_final_message()
 
+                usage = final_message.usage
+
+                room_id = transport._signalling.room_id
+
+                cost_tracker.update(
+                    room_id=room_id,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                )
+
+                stats = cost_tracker.get_room_stats(room_id)
+
+                logger.info(
+                    f"💰 Room={room_id} | "
+                    f"Input={stats['input_tokens']} | "
+                    f"Output={stats['output_tokens']} | "
+                    f"Total={stats['total_tokens']} | "
+                    f"Cost=${stats['estimated_cost']:.6f}"
+                )
+
+
+                span.set_attribute(
+                    "response.length",
+                    len(full_reply)
+                )
+
                 logger.info(
                     f"FINAL MESSAGE CONTENT: {final_message.content}"
                 )
@@ -320,6 +394,8 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
                 "role": "assistant",
                 "content": final_message.content
             })
+
+            llm_circuit_breaker.record_success()
 
             if not tool_calls:
 
@@ -337,44 +413,7 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
                     room_id = transport._signalling.room_id
                     await save_action_items(room_id, items, transport._signalling)
 
-                # ─────────────────────────────────────────
-                # Save extracted action items into Postgres
-                # ─────────────────────────────────────────
-                # REPLACE with this:
-                # if "action item" in full_reply.lower():
-
-                #     items = []
-                #     current = {}
-
-                #     for line in full_reply.split("\n"):
-                #         line = line.strip().replace("**", "").replace("*", "")
-
-                #         if line.lower().startswith("task:"):
-                #             current["task"] = line.split(":", 1)[1].strip()
-                #         elif line.lower().startswith("owner:"):
-                #             current["owner"] = line.split(":", 1)[1].strip()
-                #         elif line.lower().startswith("due date:"):
-                #             current["due_date"] = line.split(":", 1)[1].strip()
-
-                #         if "owner" in current and "task" in current:
-                #             items.append({
-                #                 "owner": current.get("owner", "Unknown"),
-                #                 "task": current.get("task", ""),
-                #                 "due_date": current.get("due_date")
-                #             })
-                #             current = {}
-
-                #     logger.info(f"Items extracted: {items}")
-                #     logger.info(f"Extracted {len(items)} action items")
-
-                #     if items:
-                #         room_id = transport._signalling.room_id
-                #         logger.info(f"Saving action items for room: {room_id}")
-                #         await save_action_items(
-                #             room_id,
-                #             items,
-                #             transport._signalling
-                #         )
+                
                 transcript_log.append({
                     "speaker": "Samvyo",
                     "text": full_reply,
@@ -384,85 +423,6 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
 
                 break
 
-            # execute requested tool(s) and send result back for final reply
-            # tool_results = []
-            # for tool_call in tool_calls:
-            #     logger.info(
-            #         f"TOOL CALLED: {tool_call.name}"
-            #     )
-
-            #     logger.info(
-            #         f"TOOL INPUT: {tool_call.input}"
-            #     )
-            #     if tool_call.name == "summarise_meeting":
-            #         summary_text = generate_meeting_summary()
-            #         tool_results.append({
-            #             "type": "tool_result",
-            #             "tool_use_id": tool_call.id,
-            #             "content": summary_text
-            #         })
-            #     elif tool_call.name == "extract_action_items":
-
-            #         logger.info(f"TOOL INPUT: {tool_call.input}")
-
-            #     transcript_text = build_action_item_context()
-
-            #     logger.info(
-            #         f"ACTION ITEM CONTEXT:\n{transcript_text}"
-            #     )
-
-            #     items = []
-
-            #     for line in transcript_text.split("\n"):
-
-            #         line = line.strip()
-
-            #         if "should" not in line.lower():
-            #             continue
-
-            #         try:
-
-            #             speaker_part, task_part = line.split(":", 1)
-
-            #             owner = task_part.split("should")[0].strip()
-
-            #             task = task_part.split("should", 1)[1].strip()
-
-            #             items.append({
-            #                 "owner": owner,
-            #                 "task": task,
-            #                 "due_date": None
-            #             })
-
-            #         except Exception as e:
-
-            #             logger.error(
-            #                 f"Action item extraction error: {e}"
-            #             )
-
-            #     logger.info(
-            #         f"DIRECTLY EXTRACTED ITEMS: {items}"
-            #     )
-
-            #     if items:
-
-            #         room_id = transport._signalling.room_id
-
-            #         logger.info(
-            #             f"Saving action items for room: {room_id}"
-            #         )
-
-            #         await save_action_items(
-            #             room_id,
-            #             items,
-            #             transport._signalling
-            #         )
-
-            #     tool_results.append({
-            #         "type": "tool_result",
-            #         "tool_use_id": tool_call.id,
-            #         "content": transcript_text
-            #     })
             tool_results = []
 
             for tool_call in tool_calls:
@@ -491,8 +451,29 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
             # loop again -> Claude streams its final spoken reply using the tool result
 
         except Exception as e:
-            logger.error(f"❌ Claude streaming error: {e}")
-            tts_queue.put_nowait("Sorry, I had a problem. Could you repeat that?")
+
+            llm_circuit_breaker.record_failure()
+
+            logger.error(
+                f"❌ Claude streaming error: {e}"
+            )
+
+            if llm_circuit_breaker.state == "OPEN":
+
+                logger.warning(
+                    "🔴 Circuit OPEN - Switching to fallback mode"
+                )
+
+                tts_queue.put_nowait(
+                    "The AI assistant is temporarily unavailable. Please try again shortly."
+                )
+
+            else:
+
+                tts_queue.put_nowait(
+                    "Sorry, I had a problem. Could you repeat that?"
+                )
+
             break
 
 async def speak_sentence(text: str, transport: MediasoupTransport):
@@ -502,59 +483,70 @@ async def speak_sentence(text: str, transport: MediasoupTransport):
         return
 
     is_speaking = True
-    task = asyncio.current_task()
-    active_tts_tasks.append(task)
-    logger.info(f"🔊 Speaking: '{text}'")
 
-    try:
-        tts_start = time.time()
+    tracer = get_tracer()
 
-        # ── STEP 1: collect all chunks from TTS ──────────────────
-        raw_chunks = []
-        first_chunk_received = False
+    with tracer.start_as_current_span("tts.generate") as tts_span:
 
-        async for audio_data in tts.stream(text):
-            if not first_chunk_received:
-                first_chunk_received = True
+        tts_span.set_attribute(
+            "text.length",
+            len(text)
+        )
 
-                # latency logging on first chunk arriving
-                if not first_audio_measured and last_llm_token_time:
-                    first_audio_measured = True
-                    logger.info(
-                        f"🎤 TTS-to-First-Audio Latency: "
-                        f"{(time.time() - last_llm_token_time) * 1000:.0f}ms"
-                    )
-                logger.info(f"⚡ First audio latency: {(time.time() - tts_start) * 1000:.0f}ms")
+        task = asyncio.current_task()
+        active_tts_tasks.append(task)
+        logger.info(f"🔊 Speaking: '{text}'")
 
-            raw_chunks.append(audio_data)
+        try:
+            tts_start = time.time()
 
-        # ── STEP 2: normalize ONCE on full audio ─────────────────
-        full_audio = b"".join(raw_chunks)
-        full_audio = normalize_audio(full_audio, Config.TARGET_DBFS)  # ← once, not 78 times
+            # ── STEP 1: collect all chunks from TTS ──────────────────
+            raw_chunks = []
+            first_chunk_received = False
 
-        # ── STEP 3: send to RTP in small chunks ──────────────────
-        chunk_size = 1024 * 2
-        sleep_per_chunk = 1024 / Config.TTS_SAMPLE_RATE
+            async for audio_data in tts.stream(text):
+                if not first_chunk_received:
+                    first_chunk_received = True
 
-        for i in range(0, len(full_audio), chunk_size):
-            chunk = full_audio[i:i + chunk_size]
-            frame = AudioRawFrame(
-                audio=chunk,
-                sample_rate=Config.TTS_SAMPLE_RATE,
-                num_channels=1
-            )
-            await transport.output().process_frame(frame, direction=None)
-            await asyncio.sleep(sleep_per_chunk)
+                    # latency logging on first chunk arriving
+                    if not first_audio_measured and last_llm_token_time:
+                        first_audio_measured = True
+                        logger.info(
+                            f"🎤 TTS-to-First-Audio Latency: "
+                            f"{(time.time() - last_llm_token_time) * 1000:.0f}ms"
+                        )
+                    logger.info(f"⚡ First audio latency: {(time.time() - tts_start) * 1000:.0f}ms")
 
-    except asyncio.CancelledError:
-        logger.info("🛑 TTS cancelled — interrupt")
-    except Exception as e:
-        logger.error(f"TTS error: {e}")
-    finally:
-        is_speaking = False
-        if task in active_tts_tasks:
-            active_tts_tasks.remove(task)
-        logger.info("🎤 Listening again...")
+                raw_chunks.append(audio_data)
+
+            # ── STEP 2: normalize ONCE on full audio ─────────────────
+            full_audio = b"".join(raw_chunks)
+            full_audio = normalize_audio(full_audio, Config.TARGET_DBFS)  # ← once, not 78 times
+
+            # ── STEP 3: send to RTP in small chunks ──────────────────
+            chunk_size = 1024 * 2
+            sleep_per_chunk = 1024 / Config.TTS_SAMPLE_RATE
+
+            for i in range(0, len(full_audio), chunk_size):
+                chunk = full_audio[i:i + chunk_size]
+                frame = AudioRawFrame(
+                    audio=chunk,
+                    sample_rate=Config.TTS_SAMPLE_RATE,
+                    num_channels=1
+                )
+                await transport.output().process_frame(frame, direction=None)
+                await asyncio.sleep(sleep_per_chunk)
+
+        except asyncio.CancelledError:
+            logger.info("🛑 TTS cancelled — interrupt")
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
+        finally:
+            is_speaking = False
+            if task in active_tts_tasks:
+                active_tts_tasks.remove(task)
+
+            logger.info("🎤 Listening again...")
 
 async def play_welcome_message(transport: MediasoupTransport):
     """
@@ -574,8 +566,12 @@ async def tts_worker(transport: MediasoupTransport):
     Single worker — pulls sentences off the queue and speaks them
     one at a time, so audio never overlaps and stays at normal speed.
     """
+
     while True:
-        text = await tts_queue.get()
+        text, ctx = await tts_queue.get()
+
+        token = context.attach(ctx)
+
         try:
             await speak_sentence(text, transport)
 
@@ -584,26 +580,14 @@ async def tts_worker(transport: MediasoupTransport):
 
         except asyncio.CancelledError:
             raise
+
         except Exception as e:
             logger.error(f"TTS worker error: {e}")
+
         finally:
+            context.detach(token)
             tts_queue.task_done()
 
-
-async def keep_alive(connection):
-    """
-    Separate task — sends silence to Deepgram
-    every 5 seconds to keep connection alive.
-    Runs independently from main loop.
-    """
-    silence = b'\x00' * CHUNK * 2
-    while True:
-        try:
-            # if is_speaking:
-            await connection.send(silence)
-        except Exception:
-            pass
-        await asyncio.sleep(5)
 
 async def comfort_noise_worker(transport):
 
@@ -689,6 +673,8 @@ async def run_bot():
     
 
     Config.validate()
+    init_tracing()
+
     logger.info("🚀 Starting pipeline...")
     logger.info(f"🎙️ Wake word: '{Config.WAKE_WORD}'")
 
@@ -757,215 +743,281 @@ async def run_bot():
     async def on_transcript(text: str, confidence: float):
         global pipeline_start_time, current_tts_task
 
+        tracer = get_tracer()
+
         if not text:
             return
+
+        # Parent span for one complete voice request
+        with tracer.start_as_current_span("voice.request") as parent_span:
+
+            parent_span.set_attribute(
+                "speaker",
+                transport._signalling.current_speaker
+            )
+
+            parent_span.set_attribute(
+                "text.length",
+                len(text)
+            )
+
+            parent_span.set_attribute(
+                "confidence",
+                confidence
+            )
+
         
-        # ── MUTE CHECK ──────────────────────────────
-        speaker     = transport._signalling.current_speaker
-        mute_states = transport._signalling.mute_states
+            # ── MUTE CHECK ──────────────────────────────
+            speaker     = transport._signalling.current_speaker
+            mute_states = transport._signalling.mute_states
 
-        if mute_states.get(speaker, False):
-            logger.info(f"🔇 Skipping — {speaker} is muted")
-            return
-        
-        logger.info(
-            f"📝 Transcript [{transport._signalling.current_speaker}]: {text}"
-        )
-        logger.info(f"🎯 Confidence: {confidence:.2f}")
+            if mute_states.get(speaker, False):
+                logger.info(f"🔇 Skipping — {speaker} is muted")
+                return
+            
+            # ── STT SPAN ────────────────────────────────
+            with tracer.start_as_current_span("stt.transcript") as span:
 
-        if confidence < 0.70:
-            logger.warning(f"❌ Transcript rejected (confidence={confidence:.2f})")
-            return
-        # Store ALL participant speech for meeting summaries
+                span.set_attribute("confidence", confidence)
+                span.set_attribute("text.length", len(text))
 
-        transcript_event = {
-            "speaker": transport._signalling.current_speaker,
-            "text": text,
-            "confidence": confidence,
-            "ts": time.time()
-        }
+                logger.info(
+                    f"📝 Transcript [{transport._signalling.current_speaker}]: {text}"
+                )
+            logger.info(f"🎯 Confidence: {confidence:.2f}")
 
-        transcript_log.append(transcript_event)
-        logger.info(
-            f"TRANSCRIPT LOG SIZE: {len(transcript_log)}"
-        )
+            if confidence < 0.70:
+                logger.warning(f"❌ Transcript rejected (confidence={confidence:.2f})")
+                return
+            
+            # Store transcript
+            transcript_event = {
+                "speaker": transport._signalling.current_speaker,
+                "text": text,
+                "confidence": confidence,
+                "ts": time.time()
+            }
 
-        logger.info(
-            f"LAST ENTRY: {transcript_log[-1]}"
-        )
+            transcript_log.append(transcript_event)
+            logger.info(
+                f"TRANSCRIPT LOG SIZE: {len(transcript_log)}"
+            )
 
-        # ── INTERRUPT HANDLING (any speech while bot is talking) ───
-        global is_speaking, active_tts_tasks
-        if is_speaking:
-            logger.info(f"🛑 Interrupt detected (any speech) — cancelling TTS: '{text}'")
-            for t in active_tts_tasks:
-                if not t.done():
-                    t.cancel()
-            active_tts_tasks.clear()
+            logger.info(
+                f"LAST ENTRY: {transcript_log[-1]}"
+            )
 
-            # drop any sentences still waiting in the queue
-            while not tts_queue.empty():
+            # ── INTERRUPT HANDLING (any speech while bot is talking) ───
+            global is_speaking, active_tts_tasks
+            if is_speaking:
+                logger.info(f"🛑 Interrupt detected (any speech) — cancelling TTS: '{text}'")
+                for t in active_tts_tasks:
+                    if not t.done():
+                        t.cancel()
+                active_tts_tasks.clear()
+
+                # drop any sentences still waiting in the queue
+                while not tts_queue.empty():
+                    try:
+                        tts_queue.get_nowait()
+                        tts_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        break
+
+                is_speaking = False
+                await asyncio.sleep(0.1)
+
+            # ── WAKE WORD CHECK ───────────────────────────────────────
+            if not contains_wake_word(text):
+                logger.info(f"💤 No wake word — ignoring: '{text}'")
+                return
+
+            logger.info(f"🔔 Wake word detected in: '{text}'")
+
+            # ── EXTRACT QUESTION ──────────────────────────────────────
+            question = get_text_after_wake_word(text)
+            if not question or question.lower() == text.lower():
+                question = "hey bot, I heard you. How can I help?"
+
+            # ── PII SCRUBBING (before LLM stage) ──────────────────────
+            with tracer.start_as_current_span("pii.scrub") as span:
+
+                original_question = question
+
+                question = pii_scrubber.scrub(question)
+
+                span.set_attribute(
+                    "pii.modified",
+                    original_question != question
+                )
+
+                span.set_attribute(
+                    "text.length",
+                    len(question)
+                )
+
+                if question != original_question:
+                    logger.info("🔒 Question scrubbed before LLM")
+
+            logger.info(f"❓ Question for Claude: '{question}'")
+
+            # ── SCREEN ANALYSIS ─────────────────────────
+            question_lower = question.lower()
+
+            if any(
+                keyword in question_lower
+                for keyword in [
+                    "screen",
+                    "slide",
+                    "presentation",
+                    "share",
+                    "shared"
+                ]
+            ):
+
+                logger.info(
+                    "👁 Screen analysis requested"
+                )
+
+                jpeg = vision.get_latest_frame()
+
+                logger.info(
+                    f"JPEG available = {jpeg is not None}"
+                )
+
+                if jpeg is None:
+
+                    await speak_sentence(
+                        "No screen share is available.",
+                        transport
+                    )
+
+                    return
+
                 try:
-                    tts_queue.get_nowait()
-                    tts_queue.task_done()
-                except asyncio.QueueEmpty:
-                    break
+                    screen_peer = vision.current_screen_sharer
 
-            is_speaking = False
-            await asyncio.sleep(0.1)
+                    if not transport._signalling.video_ai_consent.get(screen_peer, False):
+                        await speak_sentence(
+                            "The participant has not enabled AI consent.",
+                            transport,
+                        )
+                        return
 
-        # ── WAKE WORD CHECK ───────────────────────────────────────
-        if not contains_wake_word(text):
-            logger.info(f"💤 No wake word — ignoring: '{text}'")
-            return
+                    logger.info(f"👁 Running Vision ({Config.VISION_PROVIDER.upper()})")
 
-        logger.info(f"🔔 Wake word detected in: '{text}'")
+                    description = await vision.describe_screen(jpeg)
 
-        # ── EXTRACT QUESTION ──────────────────────────────────────
-        question = get_text_after_wake_word(text)
-        if not question or question.lower() == text.lower():
-            question = "hey bot, I heard you. How can I help?"
+                    logger.info(f"📥 Vision Result ({vision.last_provider.upper()}): {description}")
 
-        logger.info(f"❓ Question for Claude: '{question}'")
+                    await speak_sentence(
+                        description,
+                        transport
+                    )
 
-        # Screen analysis command
-        question_lower = question.lower()
+                except Exception as e:
 
-        if any(
-            keyword in question_lower
-            for keyword in [
-                "screen",
-                "slide",
-                "presentation",
-                "share",
-                "shared"
-            ]
-        ):
+                    logger.error(
+                        f"Vision error: {e}"
+                    )
 
-            logger.info(
-                "👁 Screen analysis requested"
-            )
-
-            jpeg = vision.get_latest_frame()
-
-            logger.info(
-                f"JPEG available = {jpeg is not None}"
-            )
-
-            if jpeg is None:
-
-                await speak_sentence(
-                    "No screen share is available.",
-                    transport
-                )
+                    await speak_sentence(
+                        "I couldn't analyse the screen.",
+                        transport
+                    )
 
                 return
+            
+            # Slide summarization command
 
-            try:
-                screen_peer = vision.current_screen_sharer
+            if (
+                "summarize" in question_lower
+                or "summary" in question_lower
+            ) and (
+                "slide" in question_lower
+                or "presentation" in question_lower
+            ):
 
-                if not transport._signalling.video_ai_consent.get(screen_peer, False):
+                logger.info("📄 Slide summarization requested")
+
+                jpeg = vision.get_latest_frame()
+
+
+                if jpeg is None:
+
                     await speak_sentence(
-                        "The participant has not enabled AI consent.",
-                        transport,
+                        "No presentation is being shared.",
+                        transport
                     )
+
                     return
 
-                logger.info(f"👁 Running Vision ({Config.VISION_PROVIDER.upper()})")
+                try:
 
-                description = await vision.describe_screen(jpeg)
+                    screen_peer = vision.current_screen_sharer
 
-                logger.info(f"📥 Vision Result ({vision.last_provider.upper()}): {description}")
+                    if not transport._signalling.video_ai_consent.get(screen_peer, False):
+                        await speak_sentence(
+                            "The participant has not enabled AI consent.",
+                            transport,
+                        )
+                        return
 
-                await speak_sentence(
-                    description,
-                    transport
-                )
+                    summary = await vision.summarise_slide(jpeg)
 
-            except Exception as e:
+                    logger.info(f"📄 Slide Summary: {summary}")
 
-                logger.error(
-                    f"Vision error: {e}"
-                )
+                    await speak_sentence(
+                        summary,
+                        transport
+                    )
 
-                await speak_sentence(
-                    "I couldn't analyse the screen.",
-                    transport
-                )
+                except Exception as e:
 
-            return
-        
-        # Slide summarization command
+                    logger.error(
+                        f"Slide summary error: {e}"
+                    )
 
-        if (
-            "summarize" in question_lower
-            or "summary" in question_lower
-        ) and (
-            "slide" in question_lower
-            or "presentation" in question_lower
-        ):
-
-            logger.info("📄 Slide summarization requested")
-
-            jpeg = vision.get_latest_frame()
-
-
-            if jpeg is None:
-
-                await speak_sentence(
-                    "No presentation is being shared.",
-                    transport
-                )
+                    await speak_sentence(
+                        "I couldn't summarize the slide.",
+                        transport
+                    )
 
                 return
+            
+            # ── SEND TRANSCRIPT ─────────────────────────
+            await transport._signalling.send_transcript(
+                speaker=transcript_event["speaker"],
+                text=transcript_event["text"],
+                confidence=transcript_event["confidence"],
+                ts=transcript_event["ts"]
+            )
 
-            try:
+            pipeline_start_time = time.time()
+            logger.info("🧠 Calling Claude (streaming)")
 
-                screen_peer = vision.current_screen_sharer
+            current_tts_task = asyncio.create_task(ask_claude_streaming(question, transport))
 
-                if not transport._signalling.video_ai_consent.get(screen_peer, False):
-                    await speak_sentence(
-                        "The participant has not enabled AI consent.",
-                        transport,
-                    )
-                    return
+    async def on_stt_recovery():
 
-                summary = await vision.summarise_slide(jpeg)
+        logger.warning("⚠️ STT failure detected")
 
-                logger.info(f"📄 Slide Summary: {summary}")
-
-                await speak_sentence(
-                    summary,
-                    transport
-                )
-
-            except Exception as e:
-
-                logger.error(
-                    f"Slide summary error: {e}"
-                )
-
-                await speak_sentence(
-                    "I couldn't summarize the slide.",
-                    transport
-                )
-
-            return
-
-        await transport._signalling.send_transcript(
-            speaker=transcript_event["speaker"],
-            text=transcript_event["text"],
-            confidence=transcript_event["confidence"],
-            ts=transcript_event["ts"]
+        await speak_sentence(
+            "I'm having trouble hearing the meeting. I'm trying to recover.",
+            transport
         )
 
-        pipeline_start_time = time.time()
-        logger.info("🧠 Calling Claude (streaming)")
+        await asyncio.sleep(60)
 
-        current_tts_task = asyncio.create_task(ask_claude_streaming(question, transport))
+        await speak_sentence(
+            "I'm unable to recover. Please try adding me again later.",
+            transport
+        )
 
+        await transport.stop()
+
+    stt.on_recovery(on_stt_recovery)
     stt.on_transcript(on_transcript)
-
     await stt.start()
 
 

@@ -46,10 +46,19 @@ RUN pip install --retries 10 --timeout 120 \
     cartesia \
     kokoro \
     av \
+    spacy \
+    opentelemetry-api==1.24.0 \
+    opentelemetry-sdk==1.24.0 \
+    opentelemetry-exporter-otlp-proto-grpc==1.24.0 \
     "deepgram-sdk>=3.0.0,<4.0.0" \
     "pipecat-ai[deepgram,anthropic,silero,cartesia]==0.0.47"
 
+RUN python3 -m spacy download en_core_web_sm
+
+
 # Fail at build time if torch missing — not at runtime
+RUN python3 -c "from opentelemetry import trace; print('✅ OpenTelemetry installed')"
+RUN python3 -c "import spacy; spacy.load('en_core_web_sm'); print('✅ spaCy model installed')"
 RUN python3 -c "import torch; print('✅ torch', torch.__version__)"
 RUN python3 -c "from PIL import Image; print('✅ Pillow installed')"
 RUN python3 -c "import torch"

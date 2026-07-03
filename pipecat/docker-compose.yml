@@ -90,6 +90,18 @@ services:
     restart: unless-stopped
     depends_on:
       - prometheus
+  
+    # ── NEW: Jaeger ─────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
 
 volumes:
   redis_data:
