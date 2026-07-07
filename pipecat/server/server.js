@@ -22,6 +22,11 @@ const workers = new Map();
 const os = require('os');
 // let plainTransportPort = 42000;
 
+const swaggerUi = require("swagger-ui-express");
+const swaggerSpec = require("./swagger");
+
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error("JWT_SECRET env var is required"); 
 // Serve client folder (correct path)
@@ -370,6 +375,37 @@ function stopBot(roomId) {
 }
 
 // Root route
+
+/**
+ * @openapi
+ * /token:
+ *   get:
+ *     summary: Issue a JWT for a username joining a room
+ *     tags: [Auth]
+ *     parameters:
+ *       - in: query
+ *         name: username
+ *         required: true
+ *         schema: { type: string }
+ *       - in: query
+ *         name: roomId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Signed JWT
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 token: { type: string }
+ *       400:
+ *         description: Missing username or roomId
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/Error' }
+ */
 app.get("/token", (req, res) => {
   const { username,roomId } = req.query;
 
@@ -389,6 +425,31 @@ app.get("/token", (req, res) => {
   res.json({ token });
 });
 
+/**
+ * @openapi
+ * /admin/consumers:
+ *   get:
+ *     summary: List all active consumers across all rooms
+ *     tags: [Admin]
+ *     responses:
+ *       200:
+ *         description: Array of consumer info objects
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 type: object
+ *                 properties:
+ *                   roomId: { type: string }
+ *                   consumerId: { type: string }
+ *                   consumingPeerId: { type: string }
+ *                   producerPeerId: { type: string }
+ *                   kind: { type: string, enum: [audio, video] }
+ *                   preferredLayers: { type: object, nullable: true }
+ *                   currentLayers: { type: object, nullable: true }
+ *                   score: { type: number, nullable: true }
+ */
 app.get('/admin/consumers', (req, res) => {
   const result = [];
   for (const [roomId, room] of roomManager.list()) {
@@ -409,6 +470,38 @@ app.get('/admin/consumers', (req, res) => {
   res.json(result);
 });
 
+/**
+ * @openapi
+ * /admin/set-layers:
+ *   post:
+ *     summary: Manually set simulcast spatial/temporal layers for a video consumer
+ *     tags: [Admin]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [roomId, consumerId, spatialLayer]
+ *             properties:
+ *               roomId: { type: string }
+ *               consumerId: { type: string }
+ *               spatialLayer: { type: integer, example: 1 }
+ *               temporalLayer: { type: integer, example: 1 }
+ *     responses:
+ *       200:
+ *         description: Layers updated
+ *       400:
+ *         description: Missing fields or consumer is not video
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/Error' }
+ *       404:
+ *         description: Room or consumer not found
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/Error' }
+ */
 app.post('/admin/set-layers', async (req, res) => {
   const { roomId, consumerId, spatialLayer, temporalLayer } = req.body;
   if (!roomId || !consumerId || spatialLayer === undefined)
@@ -430,8 +523,36 @@ app.post('/admin/set-layers', async (req, res) => {
   res.json({ ok: true, consumerId, spatialLayer, temporalLayer });
 });
 
-// server/index.js — after POST /admin/set-layers
-
+/**
+ * @openapi
+ * /admin/start-recording:
+ *   post:
+ *     summary: Start server-side recording for a video producer
+ *     tags: [Admin]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [roomId, producerId]
+ *             properties:
+ *               roomId: { type: string }
+ *               producerId: { type: string }
+ *     responses:
+ *       200:
+ *         description: Recording started
+ *       400:
+ *         description: Failed to start recording
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/Error' }
+ *       404:
+ *         description: Room not found
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/Error' }
+ */
 app.post('/admin/start-recording', async (req, res) => {
   const { roomId, producerId } = req.body;
   const room = roomManager.get(roomId);
@@ -446,6 +567,30 @@ app.post('/admin/start-recording', async (req, res) => {
   }
 });
 
+/**
+ * @openapi
+ * /admin/stop-recording:
+ *   post:
+ *     summary: Stop the active recording in a room
+ *     tags: [Admin]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [roomId]
+ *             properties:
+ *               roomId: { type: string }
+ *     responses:
+ *       200:
+ *         description: Recording stopped
+ *       404:
+ *         description: Room not found or no active recording
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/Error' }
+ */
 app.post('/admin/stop-recording', (req, res) => {
   const { roomId } = req.body;
   const room = roomManager.get(roomId);
@@ -470,7 +615,26 @@ app.post('/admin/stop-recording', (req, res) => {
   res.json({ ok: true });
 });
 
-
+/**
+ * @openapi
+ * /admin/redis/{roomId}:
+ *   get:
+ *     summary: Inspect the Redis-persisted state for a room
+ *     tags: [Admin]
+ *     parameters:
+ *       - in: path
+ *         name: roomId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Room meta and state from Redis
+ *       500:
+ *         description: Redis read failed
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/Error' }
+ */
 app.get('/admin/redis/:roomId', async (req, res) => {
   try {
     const state = await store.getRoomState(req.params.roomId);
@@ -482,12 +646,66 @@ app.get('/admin/redis/:roomId', async (req, res) => {
 });
 
 // GET /metrics — Prometheus scrape endpoint
+/**
+ * @openapi
+ * /metrics:
+ *   get:
+ *     summary: Prometheus scrape endpoint
+ *     tags: [Observability]
+ *     responses:
+ *       200:
+ *         description: Metrics in Prometheus text exposition format
+ *         content:
+ *           text/plain:
+ *             schema: { type: string }
+ */
 app.get('/metrics', async (req, res) => {
   await metrics.collectRoomMetrics(workerPool, roomManager);
   res.set('Content-Type', metrics.register.contentType);
   res.end(await metrics.register.metrics());
 });
 
+/**
+ * @openapi
+ * /meeting/{roomId}/summary:
+ *   get:
+ *     summary: Get the transcript and action items for a meeting
+ *     description: >
+ *       Serves from in-memory room state if the room is still live,
+ *       otherwise falls back to PostgreSQL for persisted action items.
+ *     tags: [Meeting]
+ *     parameters:
+ *       - in: path
+ *         name: roomId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Meeting summary
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 roomId: { type: string }
+ *                 source: { type: string, enum: [memory, database] }
+ *                 transcript:
+ *                   type: array
+ *                   items: { type: object }
+ *                 actionItems:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       owner: { type: string }
+ *                       task: { type: string }
+ *                       due_date: { type: string, nullable: true }
+ *       500:
+ *         description: Server error
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/Error' }
+ */
 app.get('/meeting/:roomId/summary', async (req, res) => {
   try {
     const roomId = req.params.roomId;
@@ -543,7 +761,35 @@ async function getActionItemsFromDB(roomId) {
   }
 }
 
-
+/**
+ * @openapi
+ * /health:
+ *   get:
+ *     summary: Health check — mediasoup worker status and room/peer counts
+ *     tags: [Observability]
+ *     responses:
+ *       200:
+ *         description: All workers healthy
+ *       503:
+ *         description: One or more workers degraded
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 status: { type: string, enum: [ok, degraded] }
+ *                 workers:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       index: { type: integer }
+ *                       alive: { type: boolean }
+ *                       roomCount: { type: integer }
+ *                 totalRooms: { type: integer }
+ *                 totalPeers: { type: integer }
+ *                 uptime: { type: number }
+ */
 app.get('/health', (req, res) => {
   const workerStatuses = workerPool.workers.map((entry, i) => ({
     index: i,
@@ -563,8 +809,27 @@ app.get('/health', (req, res) => {
   });
 });
 
-// server/index.js — after GET /admin/consumers
-
+/**
+ * @openapi
+ * /stats:
+ *   get:
+ *     summary: Detailed per-room router, transport, consumer, and producer stats
+ *     tags: [Observability]
+ *     responses:
+ *       200:
+ *         description: Stats keyed by roomId
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               additionalProperties:
+ *                 type: object
+ *                 properties:
+ *                   router: { type: object }
+ *                   transports: { type: array, items: { type: object } }
+ *                   consumers: { type: array, items: { type: object } }
+ *                   producers: { type: array, items: { type: object } }
+ */
 app.get('/stats', async (req, res) => {
   const result = {};
 

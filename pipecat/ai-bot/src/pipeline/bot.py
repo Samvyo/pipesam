@@ -111,6 +111,7 @@ def contains_wake_word(text: str) -> bool:
     wake    = re.sub(r'\s+', ' ', wake).strip()
 
     result = wake in cleaned
+
     logger.info(f"🔍 Wake word check: '{wake}' in '{cleaned}' → {result}")
     return result
 
@@ -350,13 +351,25 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
 
                                 sentence_buffer = "".join(parts)
 
-                    if event.type == "content_block_stop":
-                        block = getattr(event, "content_block", None)
-                        if block and block.type == "tool_use":
-                            tool_calls.append(block)
+                    # if event.type == "content_block_stop":
+                    #     block = getattr(event, "content_block", None)
+                    #     if block and block.type == "tool_use":
+                    #         tool_calls.append(block)
+                    final_message = stream.get_final_message()
+
+                    tool_calls = [
+                        block for block in final_message.content
+                        if block.type == "tool_use"
+                    ]
 
                 if sentence_buffer.strip():
-                    tts_queue.put_nowait(sentence_buffer.strip())
+                    # tts_queue.put_nowait(sentence_buffer.strip())
+                    tts_queue.put_nowait(
+                        (
+                            sentence_buffer.strip(),
+                            context.get_current()
+                        )
+                    )
 
                 final_message = stream.get_final_message()
 
@@ -465,13 +478,14 @@ async def ask_claude_streaming(user_text: str, transport: MediasoupTransport):
                 )
 
                 tts_queue.put_nowait(
-                    "The AI assistant is temporarily unavailable. Please try again shortly."
+                    "The AI assistant is temporarily unavailable. Please try again shortly.",context.get_current()
                 )
 
             else:
 
                 tts_queue.put_nowait(
-                    "Sorry, I had a problem. Could you repeat that?"
+                    "Sorry, I had a problem. Could you repeat that?",
+                    context.get_current()
                 )
 
             break
@@ -483,6 +497,14 @@ async def speak_sentence(text: str, transport: MediasoupTransport):
         return
 
     is_speaking = True
+
+    # ── SEND BOT SPEECH AS A LIVE CAPTION ───────────────────
+    await transport._signalling.send_transcript(
+        speaker="Samvyo",
+        text=text,
+        confidence=1.0,
+        ts=time.time()
+    )
 
     tracer = get_tracer()
 
@@ -807,6 +829,14 @@ async def run_bot():
                 f"LAST ENTRY: {transcript_log[-1]}"
             )
 
+            # ── SEND EVERY TRANSCRIPT AS A LIVE CAPTION ─────────────
+            await transport._signalling.send_transcript(
+                speaker=transcript_event["speaker"],
+                text=transcript_event["text"],
+                confidence=transcript_event["confidence"],
+                ts=transcript_event["ts"]
+            )
+
             # ── INTERRUPT HANDLING (any speech while bot is talking) ───
             global is_speaking, active_tts_tasks
             if is_speaking:
@@ -986,12 +1016,12 @@ async def run_bot():
                 return
             
             # ── SEND TRANSCRIPT ─────────────────────────
-            await transport._signalling.send_transcript(
-                speaker=transcript_event["speaker"],
-                text=transcript_event["text"],
-                confidence=transcript_event["confidence"],
-                ts=transcript_event["ts"]
-            )
+            # await transport._signalling.send_transcript(
+            #     speaker=transcript_event["speaker"],
+            #     text=transcript_event["text"],
+            #     confidence=transcript_event["confidence"],
+            #     ts=transcript_event["ts"]
+            # )
 
             pipeline_start_time = time.time()
             logger.info("🧠 Calling Claude (streaming)")

@@ -135,6 +135,16 @@ function App() {
         [data.speaker]: data.text
       }));
 
+      clearTimeout(captionTimers.current[data.speaker]);
+
+      // Auto-hide caption after 4 seconds
+      captionTimers.current[data.speaker] = setTimeout(() => {
+        setCaptions(prev => {
+          const updated = { ...prev };
+          delete updated[data.speaker];
+          return updated;
+        });
+      }, 4000);
     };
 
     room.onSlideSummary = (summary) => {
@@ -274,8 +284,7 @@ function App() {
         videoRef.current.srcObject = streamRef;
       }
 
-      // 🔥 also prepare for join
-      // room.localStream = streamRef;
+      room.localStream = streamRef;
 
     } catch (e) {
       console.warn("Camera preview failed:", e.message);
@@ -463,6 +472,43 @@ function App() {
           )}
         </div>
       )}
+
+      {/* /* LIVE TRANSCRIPT / STATUS BOX
+      {joined && (
+        <div style={{
+          position: "fixed",
+          bottom: 90,
+          right: 16,
+          width: 280,
+          maxHeight: 220,
+          overflowY: "auto",
+          background: "rgba(13,13,15,0.9)",
+          border: "1px solid #2a2a35",
+          borderRadius: 10,
+          padding: "8px 10px",
+          fontSize: 11,
+          color: "#e8e8ec",
+          zIndex: 900
+        }}>
+          <div style={{ fontWeight: 700, color: "#7c6af7", marginBottom: 6 }}>
+            📝 Live Transcript
+          </div>
+          {transcriptFeed.length === 0 && (
+            <div style={{ color: "#555" }}>Waiting for speech...</div>
+          )}
+          {transcriptFeed.map((entry, i) => (
+            <div key={i} style={{ marginBottom: 4 }}>
+              <span style={{
+                color: entry.speaker === "Samvyo" ? "#4de8a0" : "#7c6af7",
+                fontWeight: 600
+              }}>
+                {entry.speaker}:
+              </span>{" "}
+              <span>{entry.text}</span>
+            </div>
+          ))}
+        </div>
+      )} */} 
 
       {/* Recording indicator bar */}
 {isRecording && (

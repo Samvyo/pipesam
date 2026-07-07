@@ -1,96 +1,193 @@
-# Mediasoup Video Calling App
+# AI Meeting Bot — Pipecat + mediasoup Voice/Video AI
 
-Single-node real-time multi-user video calling app built with WebRTC, mediasoup SFU, Node.js, WebSocket, and React. Supports video/audio calls, screen sharing, in-call chat, Redis persistence, Prometheus metrics, and Grafana monitoring.
+OSS Project 3 — An AI-native real-time communications bot that joins a live mediasoup conference as a participant, listens, thinks, and speaks.
 
----
-
-# Features
-
-- 👥 Multi-user video conferencing
-- 🎤 Mute / Unmute
-- 📷 Camera On / Off
-- 🖥 Screen Sharing
-- 💬 In-call Chat using WebRTC DataChannel (DataProducer/DataConsumer)
-- 🔴 Client-side Recording 
-- 📶 Connection Quality Indicator
-  - 🟢 Good
-  - 🟡 Average
-  - 🔴 Poor
-- 🔐 JWT Authentication
-- 📊 Prometheus + Grafana Monitoring
-- 🧠 mediasoup SFU Architecture (Workers, Routers, Transports, Producers, Consumers)
-- 🚦 Per-peer signaling rate limiting
-- 🛑 Graceful shutdown handling (SIGTERM )
 
 # Architecture
 
 ```text
-                   +----------------------+
-                   |  Prometheus/Grafana |
-                   |      Monitoring     |
-                   +----------+----------+
-                              |
-                              v
+                                       +---------------------------------------+
+                                       |      OpenTelemetry / Logging          |
+                                       |      Traces • Metrics • Logs          |
+                                       +-------------------+------------------+
+                                                           |
+                                                           v
 
-+----------------+    WebSocket Signaling    +----------------------+
-|  React Client  | <-----------------------> |  Node.js Signaling   |
-|   WebRTC UI    |                           |        Server        |
-+--------+-------+                           +----------+-----------+
-         |                                              |
-         |                                              |
-         | RTP / Media Streams                          | Redis
-         v                                              v
-                 +----------------------------------+
-                 |          mediasoup SFU           |
-                 |   Workers / Routers / Transports |
-                 +----------------+-----------------+
-                                  ^
-                                  |
-                           TURN/STUN Relay
-                                  |
-                        +---------+---------+
-                        |      coturn       |
-                        +-------------------+
++--------------------+      WebRTC / RTP      +-------------------------------+
+|  Meeting Users     | <--------------------> |       mediasoup SFU           |
+| Browser / Client   |                        | Workers • Routers • RTP       |
++----------+---------+                        +---------------+---------------+
+           ^                                                  |
+           |                                                  |
+           | Audio / Video                                    |
+           |                                                  v
+           |                                  +-------------------------------+
+           |                                  |      Python AI Meeting Bot    |
+           |                                  |          (Pipecat)            |
+           |                                  +---------------+---------------+
+           |                                                  |
+           |              +-----------------------------------+------------------------------------+
+           |              |                                   |                                    |
+           |              v                                   v                                    v
+           |     +-------------------+           +----------------------------+          +------------------+
+           |     | STT Pipeline      |           | Vision Pipeline            |          | Wake Word / VAD  |
+           |     | Speech-to-Text    |           | Screen Analysis            |          | Voice Activity   |
+           |     |                   |           |                            |          |                  |
+           |     | Deepgram (Primary)|           | Claude Sonnet (Primary)    |          |                  |
+           |     | Whisper (Fallback)|           | Claude Haiku (Routine)     |          |                  |
+           |     +---------+---------+           | LLaVA (On-Prem Fallback)   |          +--------+---------+
+           |               |                     +-------------+--------------+                   |
+           |               +---------------------------+-------+-----------------------------------+
+           |                                           |
+           |                                           v
+           |                   +-------------------------------+
+           |                   |      PII Scrubber             |
+           |                   +---------------+---------------+
+           |                                   |
+           |                                   v
+           |                   +-------------------------------+
+           |                   |      Anthropic Claude LLM     |
+           |                   | Context • Reasoning • Tools   |
+           |                   +---------------+---------------+
+           |                                   |
+           |          +------------------------+---------------------------+
+           |          |                        |                           |
+           |          v                        v                           v
+           |  Meeting Summary         Action Items              Slide Summaries
+           |  Decisions               Q&A                      Context Memory
+           |                                   |
+           |                                   v
+           |                   +-------------------------------+
+           |                   |        TTS Orchestrator        |
+           |                   +---------------+---------------+
+           |                                   |
+           |         +-------------------------+-------------------------+
+           |         |                         |                         |
+           |         v                         v                         v
+           |   Cartesia TTS            Deepgram TTS             Kokoro TTS
+           |    (Primary)                (Fallback)            (Local Backup)
+           |                                   |
+           +-----------------------------------+
+                                               |
+                                               v
+                                   RTP Audio streamed back
+                                   to mediasoup and users
 ```
-# SFU vs Full-Mesh
 
-**Full-Mesh:** Every participant sends media directly to every other participant.
+# Features
 
-**SFU:** Clients send media once to the SFU server, and the SFU forwards streams to other participants.
+- 🎙 Real-time AI Meeting Assistant
+- 🗣 Wake Word Detection
+- 🎤 Voice Activity Detection (VAD)
+- 📝 Live Speech-to-Text
+  - Deepgram (Primary)
+  - Whisper (fallback)
+- 🤖 Context-aware Conversations using Claude
+- 🧹 PII Scrubbing before LLM processing
+- 📋 Automatic Meeting Summaries
+- ✅ Action Item Extraction
+- 📌 Decision Tracking
+- ❓ AI-powered Meeting Q&A
+- 🖥 Screen Share Analysis
+- 📄 AI Slide Summarization
+- 🔊 Multi-provider Text-to-Speech
+  - Cartesia (Primary)
+  - Deepgram (Fallback)
+  - Kokoro (Local Backup)
+- 🎧 RTP Audio Streaming with mediasoup
+- 🌐 WebRTC Integration
+- 📊 OpenTelemetry Distributed Tracing
+- 📈 Performance & Latency Monitoring
+- 🛡 Graceful STT Failure Handling (Chaos Testing)
+- 🐳 Docker-based Deployment
 
-| Feature          | Full-Mesh  | SFU         |
-| ---------------- | -----------| ------------ |
-| Upload Streams   | Multiple   | Single       |
-| Scalability      | Poor       | High         |
-| Client CPU Usage | High       | Low          |
-| Bandwidth Usage  | High       | Optimized    |
-| Best For         | Small Rooms| Large Rooms  |
-```
 
-# Project Structure
+# Quick Start
 
-```text
-/mediasoup
-├── certs
-├── client
-├── server
-├── shared
-├── docker-compose.yml
-├── prometheus.yml
-├── package.json
-└── README.md
+## 1. Clone the Repository
+
+```bash
+git clone <repository-url>
+cd pipecat
 ```
 
 ---
 
-# ⚡ Quick Start
+## 2. Configure Environment Variables
+
+Create the `.env` file inside the `ai-bot` directory and update the required API keys and configuration.
+
+Example:
+
+```env
+# API Keys
+DEEPGRAM_API_KEY=xxxxxxxx
+ANTHROPIC_API_KEY=xxxxxxxx
+
+# Cartesia
+CARTESIA_API_KEY=xxxxxxxx
+CARTESIA_VOICE_ID=xxxxxxxx
+
+# Speech-to-Text
+STT_BACKEND=deepgram
+STT_LANGUAGE=multi
+WAKE_WORD=hey bot
+
+# Text-to-Speech
+TTS_PROVIDER=cartesia
+TTS_VOICE=xxxxxxxx
+
+# Kokoro Fallback
+KOKORO_ENABLED=true
+KOKORO_VOICE=xxxxxxxx
+
+# Audio
+TTS_SAMPLE_RATE=24000
+TARGET_DBFS=-18
+TTS_TIMEOUT_SECONDS=5
+
+# Welcome Message
+WELCOME_MESSAGE=Hello everyone. I am Samvyo, your AI meeting assistant.
+
+# Database
+DB_HOST=xxxx
+DB_PORT=xxxx
+DB_NAME=xxxx
+DB_USER=xxxx
+DB_PASSWORD=xxxx
+
+# JWT
+JWT_SECRET=mysecretkey
+
+# Vision
+VISION_PROVIDER=sonnet
+VISION_MODEL=claude-haiku-4-5-20251001
+VISION_MIN_INTERVAL=5
+
+# LLaVA
+LLAVA_MODEL=llava
+LLAVA_URL=xxxx
+
+VISION_TIMEOUT=120
+
+SONNET_VISION_MODEL=claude-sonnet-4-5-20250929
+```
+
+---
+
+## 3. Start the Application
+
+From the project root, run:
 
 ```bash
-cd mediasoup
 docker compose up --build
 ```
 
-Open:
+---
+
+## 4. Open the Application
+
+Open your browser and navigate to:
 
 ```text
 https://localhost:5173
@@ -98,25 +195,34 @@ https://localhost:5173
 
 ---
 
-# Authentication
+## 6. Join a Meeting
 
+1. Authentication
 Generate token:
-
 ```text
 https://localhost:3000/token?username=yourname&roomId=room1
 ```
-
-Copy the token and paste it in the UI.
+2. Enter the generated token, your **Username**, and **Room ID**.
+3. Click **Join**.
+4. Allow microphone and camera permissions.
+5. Wait for the AI Meeting Bot to join the meeting automatically.
 
 ---
 
-# Tech Stack
+## 7. Start Interacting with the Bot
 
-- Frontend: React + Vite
-- Backend: Node.js + ws
-- Media Server: mediasoup SFU
-- Realtime: WebRTC
-- TURN/STUN: coturn
-- Persistence: Redis
-- Monitoring: Prometheus + Grafana
-- Containerization: Docker + Docker Compose
+- Say the wake word: **"Hey Bot"**.
+- Ask questions or interact naturally with the AI assistant.
+- Enable the **"Allow AI to Analyze My Shared Screen"** checkbox before starting screen sharing.
+- Share your screen for **AI-powered screen analysis**, slide summarization, and visual Q&A.
+- Request meeting summaries, action items, or ask follow-up questions during the meeting.
+
+
+## Notes
+
+- The AI Meeting Bot runs as an independent service and automatically joins the meeting after startup.
+- Speech-to-Text (STT), Text-to-Speech (TTS), and Vision AI providers are configurable through the `.env` file without requiring code changes.
+- Set `STT_BACKEND` to choose the Speech-to-Text provider (e.g., Deepgram or Whisper).
+- Set `TTS_PROVIDER` to choose the Text-to-Speech provider (e.g., Cartesia, Deepgram, or Kokoro).
+- Set `VISION_PROVIDER` and `VISION_MODEL` to configure the Vision AI model (e.g., Claude Sonnet, Claude Haiku, or LLaVA).
+- AI-powered screen analysis is available only for users who enable the **"Allow AI to Analyze My Shared Screen"** checkbox. This permission can be enabled or disabled at any time before or during screen sharing.
