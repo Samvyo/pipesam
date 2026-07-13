@@ -102,12 +102,28 @@ OSS Project 3 — An AI-native real-time communications bot that joins a live me
 - 🐳 Docker-based Deployment
 
 
+# Prerequisites
+
+Before running the project, ensure the following are installed:
+
+- Git
+- Docker
+- Docker Compose
+
+> **Note:** This project has been tested on Linux. If required, update the `ANNOUNCED_IP` value in `docker-compose.yml` with your machine's local IP address.
+
+
 # Quick Start
 
 ## 1. Clone the Repository
 
 ```bash
 git clone <repository-url>
+
+cd opensam
+
+git checkout development
+
 cd pipecat
 ```
 
