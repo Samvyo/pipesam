@@ -1,0 +1,13 @@
+# Virtual environment 
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# API keys - never commit this!
+.env
+
+# Poetry cache
+.cache/

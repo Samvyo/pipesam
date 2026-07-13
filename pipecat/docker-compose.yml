@@ -1,0 +1,110 @@
+services:
+
+  client:
+    build: ./client
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./certs:/certs
+    depends_on:
+      - signaling
+
+  signaling:
+    build: ./server
+    network_mode: "host"
+    # command: node server/server.js
+
+    env_file:
+      - ./ai-bot/.env
+
+    volumes:
+      - ./certs:/certs
+      - ./recordings:/app/recordings
+      - /home/vidya/pipesam/pipecat/ai-bot:/ai-bot
+    environment:
+      - ANNOUNCED_IP=192.168.29.128
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6379
+      # - POETRY_VIRTUALENVS_IN_PROJECT=false
+      # - POETRY_VIRTUALENVS_PATH=/ai-bot-venvs
+    depends_on:
+      - redis
+
+  coturn:
+    image: coturn/coturn
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+    command: >
+      -n
+      --log-file=stdout
+      --min-port=49152
+      --max-port=49200
+      --realm=webrtc.local
+      --user=test:test
+      --no-cli
+      --no-multicast-peers
+      --fingerprint
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+  
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: samvyo
+      POSTGRES_USER: samvyo
+      POSTGRES_PASSWORD: samvyo123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # ── NEW: Prometheus ──────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── NEW: Grafana ─────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+  
+    # ── NEW: Jaeger ─────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+volumes:
+  redis_data:
+  prometheus_data:   
+  postgres_data:
+  grafana_data:    
