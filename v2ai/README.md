@@ -124,7 +124,7 @@ cd opensam
 
 git checkout development
 
-cd pipecat
+cd v2ai
 ```
 
 ---

@@ -7,6 +7,14 @@ to prevent crackling on near-silence chunks.
 
 import numpy as np
 from loguru import logger
+from dataclasses import dataclass 
+
+@dataclass
+class AudioFrame:
+    audio: bytes
+    sample_rate: int = 16000
+    num_channels: int = 1
+
 
 def normalize_audio(pcm_bytes: bytes, target_dbfs: float = -18.0) -> bytes:
     if not pcm_bytes:

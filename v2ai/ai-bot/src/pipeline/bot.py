@@ -24,9 +24,9 @@ from .cost_tracker import CostTracker
 # from .tts.cartesia_tts import CartesiaTTS
 # from .tts.deepgram_tts import DeepgramTTS
 
-from .audio_utils import normalize_audio
+# from .audio_utils import normalize_audio
 
-from pipecat.frames.frames import AudioRawFrame
+from .audio_utils import normalize_audio, AudioFrame
 os.environ['PYTHONWARNINGS'] = 'ignore'
 import torch
 import numpy as np
@@ -551,7 +551,7 @@ async def speak_sentence(text: str, transport: MediasoupTransport):
 
             for i in range(0, len(full_audio), chunk_size):
                 chunk = full_audio[i:i + chunk_size]
-                frame = AudioRawFrame(
+                frame = AudioFrame(
                     audio=chunk,
                     sample_rate=Config.TTS_SAMPLE_RATE,
                     num_channels=1
@@ -625,7 +625,7 @@ async def comfort_noise_worker(transport):
 
                 silence = b"\x00" * (1024 * 2)
 
-                frame = AudioRawFrame(
+                frame = AudioFrame(
                     audio=silence,
                     sample_rate=Config.TTS_SAMPLE_RATE,
                     num_channels=1

@@ -1,10 +1,11 @@
 import asyncio
 from loguru import logger
 
-from pipecat.frames.frames import AudioRawFrame, EndFrame
-from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.transports.base_transport import BaseTransport
+# from pipecat.frames.frames import AudioRawFrame, EndFrame
+# from pipecat.processors.frame_processor import FrameProcessor
+# from pipecat.transports.base_transport import BaseTransport
 
+from .audio_utils import AudioFrame
 from .rtp_receiver import RTPReceiver
 from .rtp_sender import RTPSender
 from .signalling import BotSignalling
@@ -12,7 +13,7 @@ from .config import Config
 # from .video_rtp_receiver import VideoRTPReceiver
 
 
-class MediasoupInputTransport(FrameProcessor):
+class MediasoupInputTransport:
     """Reads RTP audio and pushes AudioRawFrames downstream."""
 
     def __init__(self, receiver: RTPReceiver):
@@ -34,7 +35,7 @@ class MediasoupInputTransport(FrameProcessor):
         while True:
             try:
                 pcm: bytes = await self._receiver.read_pcm_chunk()
-                frame = AudioRawFrame(
+                frame = AudioFrame(
                     audio=pcm,
                     sample_rate=16000,
                     num_channels=1
@@ -43,19 +44,19 @@ class MediasoupInputTransport(FrameProcessor):
                 # make frame available to consumers
                 await self.audio_queue.put(frame)
                 
-                await self.push_frame(frame)
+                # await self.push_frame(frame)
             except asyncio.CancelledError:
                 logger.info("MediasoupInputTransport: receive loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"MediasoupInputTransport error: {e}")
 
-    async def process_frame(self, frame, direction):
-        # Input processor: just pass frames through unchanged
-        await self.push_frame(frame, direction)
+    # async def process_frame(self, frame, direction):
+    #     # Input processor: just pass frames through unchanged
+    #     await self.push_frame(frame, direction)
 
 
-class MediasoupOutputTransport(FrameProcessor):
+class MediasoupOutputTransport:
     """Receives AudioRawFrames from pipeline and sends via RTP."""
 
     def __init__(self, sender: RTPSender):
@@ -63,14 +64,13 @@ class MediasoupOutputTransport(FrameProcessor):
         self._sender = sender
 
     async def process_frame(self, frame, direction):
-        if isinstance(frame, AudioRawFrame):
+        if isinstance(frame, AudioFrame):
             self._sender.send_audio(frame.audio)
-        else:
             # Pass non-audio frames (e.g. EndFrame) downstream
-            await self.push_frame(frame, direction)
+            # await self.push_frame(frame, direction)
 
 
-class MediasoupTransport(BaseTransport):
+class MediasoupTransport:
 
     def __init__(self,vision=None):
         super().__init__()
@@ -96,10 +96,10 @@ class MediasoupTransport(BaseTransport):
     #                 f"Video RTP error: {e}"
     #             )
 
-    def input(self) -> FrameProcessor:
+    def input(self):
         return self._input_processor
 
-    def output(self) -> FrameProcessor:
+    def output(self):
         return self._output_processor
 
     async def start(self):
