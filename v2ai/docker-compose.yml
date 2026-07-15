@@ -20,7 +20,7 @@ services:
     volumes:
       - ./certs:/certs
       - ./recordings:/app/recordings
-      - /home/vidya/pipesam/pipecat/ai-bot:/ai-bot
+      - /home/vidya/pipesam/v2ai/ai-bot:/ai-bot
     environment:
       - ANNOUNCED_IP=192.168.29.128
       - REDIS_HOST=127.0.0.1
