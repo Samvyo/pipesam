@@ -1,4 +1,4 @@
-# AI Meeting Bot — Pipecat + mediasoup Voice/Video AI
+# AI Meeting Bot — mediasoup Voice/Video AI
 
 OSS Project 3 — An AI-native real-time communications bot that joins a live mediasoup conference as a participant, listens, thinks, and speaks.
 
@@ -23,7 +23,7 @@ OSS Project 3 — An AI-native real-time communications bot that joins a live me
            |                                                  v
            |                                  +-------------------------------+
            |                                  |      Python AI Meeting Bot    |
-           |                                  |          (Pipecat)            |
+           |                                  |       (STT / LLM / TTS)       |
            |                                  +---------------+---------------+
            |                                                  |
            |              +-----------------------------------+------------------------------------+
