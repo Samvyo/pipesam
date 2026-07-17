@@ -51,6 +51,7 @@ RUN pip install --retries 10 --timeout 120 \
     opentelemetry-sdk==1.24.0 \
     opentelemetry-exporter-otlp-proto-grpc==1.24.0 \
     "deepgram-sdk>=3.0.0,<4.0.0" \
+    soxr \
     "pipecat-ai[deepgram,anthropic,silero,cartesia]==0.0.47"
 
 RUN python3 -m spacy download en_core_web_sm

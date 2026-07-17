@@ -12,6 +12,9 @@ from ..config import Config
 
 class DeepgramTTS:
     def __init__(self):
+        # Deepgram renders at whatever rate we ask for, so config is the truth.
+        self.sample_rate = Config.TTS_SAMPLE_RATE
+
         self.client = DeepgramClient(Config.DEEPGRAM_API_KEY)
 
     async def stream(self, text: str):

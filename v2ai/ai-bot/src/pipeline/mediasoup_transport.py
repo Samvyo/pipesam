@@ -65,7 +65,13 @@ class MediasoupOutputTransport:
 
     async def process_frame(self, frame, direction):
         if isinstance(frame, AudioFrame):
-            self._sender.send_audio(frame.audio)
+            # The frame declares its own rate — the sender resamples to the
+            # 48kHz stereo the Opus encoder and mediasoup expect.
+            self._sender.send_audio(
+                frame.audio,
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels,
+            )
             # Pass non-audio frames (e.g. EndFrame) downstream
             # await self.push_frame(frame, direction)
 

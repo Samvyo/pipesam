@@ -14,6 +14,10 @@ class KokoroTTS:
     _pipeline = None
 
     def __init__(self):
+        # Kokoro always renders at its own native rate and ignores
+        # TTS_SAMPLE_RATE, so it reports 24kHz rather than what config asks for.
+        self.sample_rate = KOKORO_SAMPLE_RATE
+
         logger.info(
             f"🎤 Kokoro voice configured: {Config.KOKORO_VOICE}"
         )

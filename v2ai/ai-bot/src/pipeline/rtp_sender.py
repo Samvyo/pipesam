@@ -3,7 +3,9 @@ import struct
 import time
 import math
 import asyncio
+import numpy as np
 import opuslib
+import soxr
 from loguru import logger
 
 # Opus settings — must match what we tell mediasoup
@@ -23,6 +25,11 @@ class RTPSender:
         self.timestamp = 0    # increases by FRAME_SIZE each packet
         self.ssrc = 12345678  # any fixed number, identifies our stream
         self._send_buffer = bytearray()
+
+        # Streaming resampler. It carries filter state between calls, so
+        # consecutive chunks join seamlessly instead of clicking at every seam.
+        self._resampler     = None
+        self._resample_rate = None   # input rate the resampler was built for
     
     # Create UDP socket and initialize the Opus encoder for RTP audio transmission.
     def start(self):
@@ -59,34 +66,46 @@ class RTPSender:
     def _encode_opus(self, pcm_bytes: bytes) -> bytes:
         return self.encoder.encode(pcm_bytes, FRAME_SIZE)
 
-    # ADD these two methods to RTPSender class
-    def _mono_16k_to_stereo_48k(self, pcm_16k_mono: bytes) -> bytes:
-        # Why this method exists:
-        # Deepgram TTS outputs 16kHz mono PCM
-        # But Opus encoder was initialized with SAMPLE_RATE=48000, CHANNELS=2
-        # So we must upsample before encoding
-        # 16000 × 3 = 48000 (repeat each sample 3 times)
-        # mono → stereo (duplicate sample for left and right)
-        samples = struct.unpack(
-            f'<{len(pcm_16k_mono) // 2}h',
-            pcm_16k_mono
-        )
-        upsampled = []
-        for s in samples:
-            for _ in range(3):       # upsample 16k → 48k
-                upsampled.append(s)  # left channel
-                upsampled.append(s)  # right channel (mono → stereo)
-        return struct.pack(f'<{len(upsampled)}h', *upsampled)
+    def _to_48k_stereo(self, pcm_mono: bytes, sample_rate: int) -> bytes:
+        # The Opus encoder was created for 48kHz stereo, so whatever the TTS
+        # provider gave us has to land there. TTS rates vary (Deepgram/Cartesia
+        # follow TTS_SAMPLE_RATE, Kokoro is natively 24kHz), so the input rate
+        # is whatever the caller declares — never assumed.
+        mono = np.frombuffer(pcm_mono, dtype=np.int16)
+
+        if sample_rate != SAMPLE_RATE:
+            if sample_rate != self._resample_rate:
+                # first chunk, or the rate changed — start a fresh resampler
+                self._resample_rate = sample_rate
+                self._resampler = soxr.ResampleStream(
+                    sample_rate,      # from
+                    SAMPLE_RATE,      # to: 48kHz
+                    1,                # mono
+                    dtype="int16",
+                    quality="HQ",
+                )
+
+            mono = self._resampler.resample_chunk(mono)
+
+        # mono → stereo: same sample on both channels, interleaved L,R,L,R...
+        return np.repeat(mono, 2).tobytes()
 
 
-    def send_audio(self, pcm_16k_mono: bytes):
-    
-        # Step 1: upsample 16kHz mono → 48kHz stereo
-        # Why: Opus encoder needs 48kHz stereo to match what we told MediaSoup
-        pcm_48k = self._mono_16k_to_stereo_48k(pcm_16k_mono)
+    def send_audio(self, pcm_mono: bytes, sample_rate: int, num_channels: int = 1):
+        if not pcm_mono:
+            return
 
-        # Step 2: buffer incoming audio
-        
+        # Step 1: fold to mono if the caller handed us stereo
+        if num_channels == 2:
+            stereo = np.frombuffer(pcm_mono, dtype=np.int16).reshape(-1, 2)
+            pcm_mono = stereo.mean(axis=1).astype(np.int16).tobytes()
+
+        # Step 2: resample to 48kHz stereo to match the encoder and what we
+        # told mediasoup in rtpParameters
+        pcm_48k = self._to_48k_stereo(pcm_mono, sample_rate)
+
+        # Step 3: buffer incoming audio
+
         self._send_buffer.extend(pcm_48k)
 
         bytes_per_frame = FRAME_SIZE * CHANNELS * 2  # 960 * 2 * 2 = 3840
