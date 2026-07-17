@@ -546,14 +546,20 @@ async def speak_sentence(text: str, transport: MediasoupTransport):
             full_audio = normalize_audio(full_audio, Config.TARGET_DBFS)  # ← once, not 78 times
 
             # ── STEP 3: send to RTP in small chunks ──────────────────
+            # Take the rate from the provider, not from config: a fallback may
+            # have served this sentence at its own native rate (Kokoro is always
+            # 24kHz). Safe to read here — the stream above is fully consumed, so
+            # this reflects whoever actually produced the audio.
+            tts_rate = getattr(tts, "sample_rate", Config.TTS_SAMPLE_RATE)
+
             chunk_size = 1024 * 2
-            sleep_per_chunk = 1024 / Config.TTS_SAMPLE_RATE
+            sleep_per_chunk = 1024 / tts_rate
 
             for i in range(0, len(full_audio), chunk_size):
                 chunk = full_audio[i:i + chunk_size]
                 frame = AudioFrame(
                     audio=chunk,
-                    sample_rate=Config.TTS_SAMPLE_RATE,
+                    sample_rate=tts_rate,
                     num_channels=1
                 )
                 await transport.output().process_frame(frame, direction=None)
@@ -619,6 +625,11 @@ async def comfort_noise_worker(transport):
 
         try:
 
+            # Match whatever rate the TTS is producing. If comfort noise
+            # declared a different rate, the sender would rebuild its resampler
+            # every time the two alternated.
+            tts_rate = getattr(tts, "sample_rate", Config.TTS_SAMPLE_RATE)
+
             if not is_speaking:
 
                 logger.debug("🔇 Sending comfort noise")
@@ -627,7 +638,7 @@ async def comfort_noise_worker(transport):
 
                 frame = AudioFrame(
                     audio=silence,
-                    sample_rate=Config.TTS_SAMPLE_RATE,
+                    sample_rate=tts_rate,
                     num_channels=1
                 )
 
@@ -637,7 +648,7 @@ async def comfort_noise_worker(transport):
                 )
 
             await asyncio.sleep(
-                1024 / Config.TTS_SAMPLE_RATE
+                1024 / tts_rate
             )
 
         except asyncio.CancelledError:

@@ -19,6 +19,12 @@ import time
 
 class CartesiaTTS:
     def __init__(self):
+        # Rate of the audio this object last produced. Cartesia renders at the
+        # rate we ask for, but a fallback may not — Kokoro is always 24kHz — so
+        # this is updated per stream() to match whoever actually served it.
+        # Callers must read it *after* consuming the stream.
+        self.sample_rate = Config.TTS_SAMPLE_RATE
+
         self.client = AsyncCartesia(api_key=Config.CARTESIA_API_KEY)
         self._ws = None
 
@@ -39,6 +45,7 @@ class CartesiaTTS:
         logger.info("🟢 USING CARTESIA")
         # 1. Try Cartesia
         sent_any = False
+        self.sample_rate = Config.TTS_SAMPLE_RATE   # what we ask Cartesia for
         try:
             async for chunk in self._stream_cartesia(text):
                 sent_any = True
@@ -54,6 +61,7 @@ class CartesiaTTS:
         sent_any = False
         try:
             dg = DeepgramTTS()
+            self.sample_rate = dg.sample_rate    # the rate now follows the server
             async for chunk in dg.stream(text):
                 sent_any = True
                 yield chunk
@@ -67,6 +75,7 @@ class CartesiaTTS:
         # 3. Fall back to Kokoro (local, no network — last resort)
         try:
             kk = KokoroTTS()
+            self.sample_rate = kk.sample_rate    # 24kHz, whatever config says
             async for chunk in kk.stream(text):
                 yield chunk
         except Exception as e:

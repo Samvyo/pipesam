@@ -1,8 +1,9 @@
 import socket
 import opuslib
 import asyncio
-import audioop
 import struct
+import numpy as np
+import soxr
 from loguru import logger
 from .vp8_decoder import VP8Decoder
 from .frame_sampler import FrameSampler
@@ -32,6 +33,9 @@ class RTPReceiver:
         self.port = port
         self.sock = None
         self.decoders = {}
+        # One streaming resampler per SSRC, mirroring the per-SSRC Opus
+        # decoders — keeps each speaker's filter state separate.
+        self.resamplers = {}
         self._skip_count = {}  # count of packets to skip after corruption detected
         self._header_logged = False  # log RTP header info only for the first packet
         self._signalling = None 
@@ -248,10 +252,25 @@ class RTPReceiver:
             return bytes(OPUS_FRAME_SIZE * OPUS_CHANNELS * 2), True  # True = silence
 
    
-    def _stereo_48k_to_mono_16k(self, pcm_48k_stereo: bytes) -> bytes:
-        mono_48k = audioop.tomono(pcm_48k_stereo, 2, 0.5, 0.5)
-        mono_16k, _ = audioop.ratecv(mono_48k, 2, 1, 48000, 16000, None)
-        return mono_16k
+    def _stereo_48k_to_mono_16k(self, ssrc: int, pcm_48k_stereo: bytes) -> bytes:
+        # Downmix 48kHz stereo → mono, then resample to the 16kHz the speech
+        # models want. Going down in rate needs an anti-aliasing filter, which
+        # is soxr's job — and its state is kept per SSRC so consecutive packets
+        # from one speaker join without clicking at the seams.
+        stereo = np.frombuffer(pcm_48k_stereo, dtype=np.int16).reshape(-1, 2)
+        mono_48k = stereo.mean(axis=1).astype(np.int16)
+
+        if ssrc not in self.resamplers:
+            self.resamplers[ssrc] = soxr.ResampleStream(
+                OPUS_SAMPLE_RATE,     # 48000
+                OUTPUT_SAMPLE_RATE,   # 16000
+                1,                    # mono
+                dtype="int16",
+                quality="HQ",
+            )
+
+        mono_16k = self.resamplers[ssrc].resample_chunk(mono_48k)
+        return mono_16k.tobytes()
 
     # Receive RTP packets, extract Opus audio, decode to PCM, and return Deepgram-ready audio chunks.
     async def read_pcm_chunk(self) -> bytes:
@@ -389,7 +408,7 @@ class RTPReceiver:
                     return bytes(PCM_16K_SILENCE_BYTES)
  
                 # Step 3 — downsample 48kHz stereo → 16kHz mono
-                pcm_16k = self._stereo_48k_to_mono_16k(pcm_48k)
+                pcm_16k = self._stereo_48k_to_mono_16k(ssrc, pcm_48k)
         
                 return pcm_16k
 

@@ -14,6 +14,10 @@ loguru = "^0.7.2"
 aiohttp = "^3.9.0"
 deepgram-sdk = ">=3.0.0,<4.0.0"
 opuslib = "^3.0.1"
+# Audio resampling for the RTP send/receive paths. Replaces the stdlib
+# `audioop`, which was removed in Python 3.13.
+soxr = "^1.0.0"
+numpy = "^2.0.0"
 httpx = "0.27.2"
 torch = ">=2.0.0,<3.0.0"
 av = "^17.1.0"
